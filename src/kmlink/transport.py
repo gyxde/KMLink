@@ -44,6 +44,51 @@ class ProtocolError(ValueError):
     """A peer sent an invalid or unauthenticated frame."""
 
 
+
+def _complete_handshake(
+    sock: ssl.SSLSocket,
+    stopped: Callable[[], bool] | threading.Event,
+    timeout: float = HANDSHAKE_TIMEOUT,
+) -> None:
+    """Negotiate TLS without hiding cancellation inside a blocking SSL read.
+
+    Closing a socket from another thread does not reliably interrupt a pending
+    OpenSSL handshake on macOS. Poll readiness in short intervals instead, with
+    one deadline for the entire handshake, then restore the caller's timeout.
+    """
+    is_stopped = stopped.is_set if isinstance(stopped, threading.Event) else stopped
+    if is_stopped():
+        raise ConnectionAbortedError("TLS handshake stopped")
+    deadline = time.monotonic() + timeout
+    previous_timeout = sock.gettimeout()
+    try:
+        sock.setblocking(False)
+        while True:
+            if is_stopped():
+                raise ConnectionAbortedError("TLS handshake stopped")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("TLS handshake timed out")
+            try:
+                sock.do_handshake()
+                return
+            except ssl.SSLWantReadError:
+                readable, writable = [sock], []
+            except ssl.SSLWantWriteError:
+                readable, writable = [], [sock]
+            try:
+                select.select(readable, writable, [], min(0.1, remaining))
+            except (OSError, ValueError) as exc:
+                if is_stopped():
+                    raise ConnectionAbortedError("TLS handshake stopped") from exc
+                raise
+    finally:
+        try:
+            sock.settimeout(previous_timeout)
+        except (OSError, ValueError):
+            pass
+
+
 def generate_pairing_key() -> str:
     """Return a copyable key with 256 bits of entropy."""
     return _b64(secrets.token_bytes(32))
@@ -360,7 +405,7 @@ class Transport:
                     try:
                         secure = context.wrap_socket(raw, server_side=True, do_handshake_on_connect=False)
                         self._install_socket(run, secure)
-                        secure.do_handshake()
+                        _complete_handshake(secure, run.stop, HANDSHAKE_TIMEOUT)
                         secure.settimeout(0.25)
                         _server_auth(secure, key, digest, run.stop)
                     except (OSError, ValueError) as exc:
@@ -390,7 +435,7 @@ class Transport:
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             secure = context.wrap_socket(raw, server_hostname=None, do_handshake_on_connect=False)
             self._install_socket(run, secure)
-            secure.do_handshake()
+            _complete_handshake(secure, run.stop, HANDSHAKE_TIMEOUT)
             secure.settimeout(0.25)
             _client_auth(secure, key, run.stop)
             self._session(run, secure)

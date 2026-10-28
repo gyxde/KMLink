@@ -225,5 +225,43 @@ class PairingTests(unittest.TestCase):
                 PairingService("device", name, "Windows", lambda *_: None)
 
 
+    def test_stop_interrupts_idle_incoming_tls_handshake(self):
+        server, _ = self.service("server")
+        peer = socket.create_connection(("127.0.0.1", server.port), timeout=1)
+        try:
+            wait_for(lambda: bool(server._run.workers))
+            workers = list(server._run.workers)
+            wait_for(lambda: any(isinstance(sock, ssl.SSLSocket) for sock in server._run.sockets))
+            server.stop()
+            for worker in workers:
+                worker.join(.5)
+                self.assertFalse(worker.is_alive())
+        finally:
+            peer.close()
+
+    def test_cancel_interrupts_idle_outgoing_tls_handshake(self):
+        client, events = self.service("client")
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(1)
+        peer = None
+        try:
+            request_id = client.request("server", "127.0.0.1", listener.getsockname()[1], "control")
+            peer, _ = listener.accept()
+            wait_for(lambda: client._run.pending is not None and isinstance(client._run.pending.sock, ssl.SSLSocket))
+            workers = list(client._run.workers)
+            client.cancel(request_id)
+            wait_for(lambda: client._run.pending is None)
+            for worker in workers:
+                worker.join(.5)
+                self.assertFalse(worker.is_alive())
+            self.assertIsNotNone(self.event(events, "rejected"))
+        finally:
+            if peer:
+                peer.close()
+            listener.close()
+
+
 if __name__ == "__main__":
     unittest.main()

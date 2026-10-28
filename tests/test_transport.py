@@ -5,6 +5,7 @@ import socket
 import ssl
 import struct
 import threading
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -12,7 +13,7 @@ from unittest.mock import patch
 import kmlink.transport as transport_module
 from kmlink.transport import (
     MAX_MESSAGE_BYTES, ProtocolError, Transport, _encode, _read_frame,
-    _b64, _client_auth, _proof, _transcript, _unb64,
+    _b64, _client_auth, _complete_handshake, _proof, _server_context, _transcript, _unb64,
     generate_pairing_key, normalize_pairing_key,
 )
 
@@ -193,6 +194,81 @@ class TransportTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
         finally:
             peer.close()
+
+
+    def test_client_stop_interrupts_an_idle_tls_server(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2)
+        client, _, _ = self.transport()
+        peer = None
+        try:
+            client.connect("127.0.0.1", listener.getsockname()[1], generate_pairing_key())
+            peer, _ = listener.accept()
+            wait_until(lambda: isinstance(client._run.sock, ssl.SSLSocket), timeout=2)
+            thread = client._run.thread
+            client.stop()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+        finally:
+            if peer:
+                peer.close()
+            listener.close()
+
+
+class TLSHandshakeTests(unittest.TestCase):
+    def setUp(self):
+        with tempfile.TemporaryDirectory(prefix="kmlink-handshake-test-") as directory:
+            context, _ = _server_context(directory)
+        raw, self.peer = socket.socketpair()
+        self.secure = context.wrap_socket(raw, server_side=True, do_handshake_on_connect=False)
+        self.secure.settimeout(1.5)
+
+    def tearDown(self):
+        self.secure.close()
+        self.peer.close()
+
+    def test_idle_peer_has_one_bounded_handshake_deadline(self):
+        start = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            _complete_handshake(self.secure, lambda: False, timeout=.12)
+        self.assertLess(time.monotonic() - start, .75)
+        self.assertEqual(self.secure.gettimeout(), 1.5)
+
+    def test_event_cancels_handshake_without_closing_socket(self):
+        stop = threading.Event()
+        entered = threading.Event()
+        failures = []
+
+        def negotiate():
+            entered.set()
+            try:
+                _complete_handshake(self.secure, stop, timeout=2)
+            except Exception as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=negotiate, daemon=True)
+        worker.start()
+        self.assertTrue(entered.wait(.5))
+        time.sleep(.03)
+        stop.set()
+        worker.join(.75)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], ConnectionAbortedError)
+        self.assertEqual(self.secure.gettimeout(), 1.5)
+
+    def test_cancel_racing_select_close_is_reported_as_cancelled(self):
+        stop = threading.Event()
+
+        def closed_during_poll(*args):
+            stop.set()
+            raise ValueError("file descriptor cannot be a negative integer")
+
+        with patch.object(transport_module.select, "select", side_effect=closed_during_poll):
+            with self.assertRaises(ConnectionAbortedError):
+                _complete_handshake(self.secure, stop, timeout=1)
 
 
 if __name__ == "__main__":

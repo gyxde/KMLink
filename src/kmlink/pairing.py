@@ -23,7 +23,7 @@ import time
 import uuid
 from typing import Callable
 
-from .transport import _server_context, generate_pairing_key, normalize_pairing_key
+from .transport import _complete_handshake, _server_context, generate_pairing_key, normalize_pairing_key
 
 
 PROTOCOL = "kmlink-invite/1"
@@ -441,7 +441,7 @@ class PairingService:
             with run.lock:
                 run.sockets.discard(raw)
             self._track(run, secure)
-            secure.do_handshake()
+            _complete_handshake(secure, run.stop, HANDSHAKE_TIMEOUT)
             secure.settimeout(.2)
             request = _read(secure, run.stop.is_set)
             if request.get("type") != "request" or request.get("protocol") != PROTOCOL:
@@ -505,7 +505,7 @@ class PairingService:
                 run.sockets.discard(raw)
             self._track(run, secure)
             session.sock = secure
-            secure.do_handshake()
+            _complete_handshake(secure, lambda: run.stop.is_set() or session.cancelled.is_set(), HANDSHAKE_TIMEOUT)
             secure.settimeout(.2)
             session.peer_ip = secure.getpeername()[0]
             digest = hashlib.sha256(secure.getpeercert(binary_form=True)).digest()
