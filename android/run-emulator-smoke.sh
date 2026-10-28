@@ -29,7 +29,17 @@ if [[ ! -e /dev/kvm ]]; then
 fi
 sudo chmod 666 /dev/kvm
 AVDMANAGER="$TOOLS/avdmanager"
-printf 'no\n' | "$AVDMANAGER" create avd --force --name kmlink-smoke --package "system-images;android-35;google_apis;x86_64" --device pixel_5
+# Older avdmanager and newer emulator releases use different default home layouts.
+# Keep both tools on the same explicit directory in this ephemeral runner.
+export ANDROID_USER_HOME="${RUNNER_TEMP:-$PROJECT_ROOT/android/build}/kmlink-android-home"
+export ANDROID_EMULATOR_HOME="$ANDROID_USER_HOME"
+export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
+mkdir -p "$ANDROID_AVD_HOME"
+printf 'no\n' | "$AVDMANAGER" create avd --force --name kmlink-smoke --path "$ANDROID_AVD_HOME/kmlink-smoke.avd" --package "system-images;android-35;google_apis;x86_64" --device pixel_5
+if ! "$SDK/emulator/emulator" -list-avds | grep -Fx 'kmlink-smoke'; then
+  echo "The emulator cannot find the AVD created in $ANDROID_AVD_HOME." >&2
+  exit 1
+fi
 export ANDROID_SERIAL=emulator-5554
 "$SDK/platform-tools/adb" start-server
 "$SDK/emulator/emulator" -avd kmlink-smoke -port 5554 -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect -accel on -cores 2 -memory 2048 > "$REPORTS/emulator.log" 2>&1 &
