@@ -15,6 +15,8 @@ import threading
 import time
 from typing import Callable
 
+from .network import local_ipv4_addresses
+
 
 DISCOVERY_GROUP = "239.255.77.77"
 DISCOVERY_PORT = 24881
@@ -217,15 +219,7 @@ class _RateLimit:
 
 def _interface_addresses() -> list[str]:
     """Use each known IPv4 adapter; the default interface remains a fallback."""
-    result = {"0.0.0.0"}
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM):
-            address = ipaddress.IPv4Address(info[4][0])
-            if not address.is_loopback and not address.is_unspecified and not address.is_multicast:
-                result.add(str(address))
-    except (OSError, ValueError):
-        pass
-    return sorted(result)[:17]
+    return ["0.0.0.0", *local_ipv4_addresses()[:16]]
 
 
 @dataclass

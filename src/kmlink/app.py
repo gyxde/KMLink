@@ -24,6 +24,7 @@ from . import __version__
 from .engine import Bounds, Engine
 from .discovery import Discovery
 from .native import NativeInput, enable_dpi_awareness, permissions_status, validate_key_code
+from .network import local_ipv4_addresses
 from .pairing import PairingService
 from .transport import generate_pairing_key, normalize_pairing_key
 
@@ -79,11 +80,7 @@ def card():
 
 
 def local_addresses():
-    try:
-        return sorted({item[4][0] for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
-                       if not item[4][0].startswith("127.")})
-    except OSError:
-        return []
+    return local_ipv4_addresses()
 
 
 def system_name():
