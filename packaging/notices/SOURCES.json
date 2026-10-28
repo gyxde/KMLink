@@ -1,0 +1,20 @@
+[
+  {
+    "file": "LGPL-3.0-only.txt",
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.8.0/LICENSES/LGPL-3.0-only.txt",
+    "sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768",
+    "purpose": "Verbatim Qt upstream GNU license text; supplements Qt wheel metadata."
+  },
+  {
+    "file": "GPL-3.0-only.txt",
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.8.0/LICENSES/GPL-3.0-only.txt",
+    "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+    "purpose": "Verbatim Qt upstream GNU license text; supplements Qt wheel metadata."
+  },
+  {
+    "file": "GPL-2.0-only.txt",
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.8.0/LICENSES/GPL-2.0-only.txt",
+    "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+    "purpose": "Verbatim Qt upstream GNU license text; supplements Qt wheel metadata."
+  }
+]

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kmlink"
+version = "0.2.0"
+description = "Share a keyboard and mouse between Windows and macOS over a local network"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "KMLink contributors"}]
+dependencies = [
+    "PySide6-Essentials>=6.8,<7",
+    "pynput>=1.8.2,<2",
+    "cryptography>=44,<51",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Topic :: Desktop Environment",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6,<7"]
+
+[project.gui-scripts]
+kmlink = "kmlink.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

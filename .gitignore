@@ -1,0 +1,17 @@
+.venv/
+.vendor/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+packaging/generated/
+.DS_Store
+*.log
+artifacts/
+.tools/
+release-assets/
+release-notes.md
