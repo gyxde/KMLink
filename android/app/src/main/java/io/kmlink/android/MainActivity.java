@@ -30,15 +30,26 @@ public final class MainActivity extends Activity implements LinkService.Observer
     private Spinner side;
     private String selectedId,dialogId;
     private AlertDialog dialog;
+    private UpdateController updater;
+    private TextView updateStatus;
+    private Button updateCheck,updateInstall,updateCancel;
+    private boolean updateBusy,updateAvailable;
     private final Map<Integer,String> forwardedKeys=new HashMap<>();
     private final ServiceConnection connection=new ServiceConnection(){
         public void onServiceConnected(ComponentName name,IBinder binder){service=((LinkService.LocalBinder)binder).service();bound=true;service.addObserver(MainActivity.this);}
         public void onServiceDisconnected(ComponentName name){service=null;render();}
     };
-    @Override public void onCreate(Bundle state){super.onCreate(state);buildUi();}
+    @Override public void onCreate(Bundle state){
+        super.onCreate(state);buildUi();
+        updater=new UpdateController(this,(message,action,busy,available)->{
+            updateStatus.setText(message);updateBusy=busy;updateAvailable=available;
+            updateInstall.setText(action);renderUpdateButtons();
+        },()->{if(service!=null)service.stopNetwork();},this::updatesAllowed);
+    }
     @Override protected void onStart(){super.onStart();bound=bindService(new Intent(this,LinkService.class),connection,Context.BIND_AUTO_CREATE);}
-    @Override protected void onResume(){super.onResume();foreground=true;render();}
-    @Override protected void onPause(){foreground=false;releaseForwardedKeys();if(service!=null&&service.isControlling())service.stopControl();dismissDialog();super.onPause();}
+    @Override protected void onResume(){super.onResume();foreground=true;if(updater!=null)updater.resume();render();}
+    @Override protected void onPause(){foreground=false;if(updater!=null)updater.pause();releaseForwardedKeys();if(service!=null&&service.isControlling())service.stopControl();dismissDialog();super.onPause();}
+    @Override protected void onDestroy(){if(updater!=null)updater.close();super.onDestroy();}
     @Override protected void onStop(){if(service!=null)service.removeObserver(this);if(bound){unbindService(connection);bound=false;}service=null;super.onStop();}
     @Override public void onStateChanged(){render();}
     private int dp(float value){return Math.round(value*getResources().getDisplayMetrics().density);}
@@ -62,7 +73,7 @@ public final class MainActivity extends Activity implements LinkService.Observer
         ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);scroll.setBackgroundColor(Color.rgb(244,246,248));
         LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setPadding(dp(18),dp(20),dp(18),dp(24));scroll.addView(root);
         scroll.setOnApplyWindowInsetsListener((v,i)->{v.setPadding(0,i.getSystemWindowInsetTop(),0,i.getSystemWindowInsetBottom());return i;});setContentView(scroll);
-        root.addView(label("KMLink   Android 0.3.0",14,true));root.addView(label("连接电脑，也让电脑控制手机。",25,true));root.addView(label("同一局域网 · 配对数字确认 · 加密直连",13,false));
+        root.addView(label("KMLink   Android "+UpdateController.installedVersion(this),14,true));root.addView(label("连接电脑，也让电脑控制手机。",25,true));root.addView(label("同一局域网 · 配对数字确认 · 加密直连",13,false));
         status=label("未连接 · 点击开始发现",15,true);root.addView(status);
         LinearLayout network=card(root,"1  发现与连接");
         start=button(network,"开始发现设备",true,v->requestStart());
@@ -95,6 +106,12 @@ public final class MainActivity extends Activity implements LinkService.Observer
         sendClipboard=button(clipboard,"发送本机剪贴板",false,v->sendLocalClipboard());clipboardPreview=label("尚未收到对端文本",13,false);clipboard.addView(clipboardPreview);
         copyIncoming=button(clipboard,"复制收到的文本",false,v->{if(service!=null){((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("KMLink",service.clipboardText()));toast("已复制");}});
         root.addView(label("没有屏幕投屏。Android 通过辅助功能点击、滑动和编辑可访问的输入框；拖动在鼠标松开后执行。部分应用和厂商系统可能限制操作。",12,false));
+        LinearLayout updates=card(root,"5  软件更新");
+        updateStatus=label("更新来源：GitHub gyxde/KMLink",13,false);updates.addView(updateStatus);
+        updateCheck=button(updates,"检查新版本",false,v->{if(updater!=null&&updatesAllowed())updater.check(true);});
+        updateInstall=button(updates,"下载并安装更新",true,v->{if(updater!=null)updater.downloadOrInstall();});updateInstall.setEnabled(false);
+        updateCancel=button(updates,"取消下载",false,v->{if(updater!=null)updater.cancel();});updateCancel.setEnabled(false);
+        updates.addView(label("启动时自动检查，最多每 6 小时一次。停止控制连接后，从本机发起更新。下载后验证版本、SHA-256 和应用签名，再由 Android 系统确认安装。",12,false));
     }
     private void requestStart(){
         if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED){pendingStart=true;requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},NOTIFICATIONS);return;}
@@ -125,6 +142,12 @@ public final class MainActivity extends Activity implements LinkService.Observer
         sendClipboard.setEnabled(connected);copyIncoming.setEnabled(connected&&service!=null&&!service.clipboardText().isEmpty());
         if(service!=null){String received=service.clipboardText();clipboardPreview.setText(received.isEmpty()?"尚未收到对端文本":received.length()>160?received.substring(0,160)+"…":received);}
         if(foreground&&pending!=null&&!pending.id.equals(dialogId))showPairing(pending);if(pending==null&&dialog!=null)dismissDialog();
+        renderUpdateButtons();
+    }
+    private boolean updatesAllowed(){return service==null||(!service.isConnected()&&service.pending()==null);}
+    private void renderUpdateButtons(){
+        if(updateCheck==null)return;boolean local=updatesAllowed();
+        updateCheck.setEnabled(local&&!updateBusy);updateInstall.setEnabled(local&&updateAvailable&&!updateBusy);updateCancel.setEnabled(local&&updateBusy);
     }
     private void showPairing(PendingRequest request){
         dismissDialog();dialogId=request.id;boolean receiver="receiver".equals(request.localRole);

@@ -189,12 +189,20 @@ class NativeInput:
         self._anchor = (0, 0)
         self._restore = None
         self._tag = 0x4B4D4C4B
+        self._probe_tag = 0x4B4D5052
+        self._mouse_probe_sent = 0.
+        self._mouse_probe_seen = 0.
         self._clicks: dict[str, tuple[float, tuple[int, int], int]] = {}
         self._darwin_key_suppress = False
         self._started = False
         self._stopping = threading.Event()
         self._monitor = None
         self._windows_mouse = None
+        self._listener_failed = False
+
+    @property
+    def needs_restart(self) -> bool:
+        return self._listener_failed
 
     def start(self) -> None:
         if self._started:
@@ -232,6 +240,7 @@ class NativeInput:
                 listener.start()
                 self._wait_until_ready(listener)
             self._started = True
+            self._listener_failed = False
             self._stopping.clear()
             self._monitor = threading.Thread(target=self._monitor_listeners, daemon=True,
                                              name="KMLink input watchdog")
@@ -261,14 +270,41 @@ class NativeInput:
 
     def _monitor_listeners(self) -> None:
         while not self._stopping.wait(0.25):
-            if any(not listener.is_alive() for listener in self._listeners):
+            if (any(not listener.is_alive() for listener in self._listeners)
+                    or not self._mouse_hook_healthy()):
                 # Failure of one hook must not leave the other hook capturing.
                 self.capturing = False
+                self._listener_failed = True
                 try:
                     self.on_emergency()
                 except Exception:
                     pass
                 return
+
+    def _mouse_hook_healthy(self, now=None) -> bool:
+        """Detect a silently removed Windows low-level mouse hook.
+
+        Windows can remove WH_MOUSE_LL after a timeout while its Python thread
+        remains alive. A tagged zero-distance input confirms actual callbacks;
+        failure returns local control instead of leaving only the keyboard on
+        the remote computer. The probe never changes the cursor coordinates.
+        """
+        if sys.platform != "win32" or not self.capturing:
+            return True
+        now = time.monotonic() if now is None else now
+        if self._mouse_probe_sent > self._mouse_probe_seen:
+            return now - self._mouse_probe_sent < 1.2
+        if now - self._mouse_probe_sent < .5:
+            return True
+        try:
+            backend = self._windows_mouse
+            if backend is None:
+                return False
+            self._mouse_probe_sent = now
+            backend.move_to(*self.position(), self._probe_tag)
+        except Exception:
+            return False
+        return True
 
     def stop(self) -> None:
         self._stopping.set()
@@ -309,6 +345,7 @@ class NativeInput:
         with self._lock:
             if not enabled:
                 self.capturing = False
+                self._mouse_probe_sent = self._mouse_probe_seen = 0.
                 if self._restore and self._mouse:
                     self._warp_to(*self._restore)
                 self._restore = None
@@ -320,8 +357,22 @@ class NativeInput:
             if self._physical_keys or self._physical_buttons:
                 raise RuntimeError("请先松开键盘按键和鼠标按钮，再切换到另一台电脑。")
             self._restore = self.position()
-            self._anchor = self._capture_center()
-            self._warp_to(*self._anchor)
+            try:
+                requested = self._capture_center()
+                self._warp_to(*requested)
+                actual = self.position()
+                if (sys.platform == "win32"
+                        and max(abs(actual[i] - requested[i]) for i in (0, 1)) > 2):
+                    raise RuntimeError("当前窗口限制了鼠标位置，请退出该窗口的鼠标锁定后重试。")
+            except Exception:
+                self.capturing = False
+                try:
+                    self._warp_to(*self._restore)
+                finally:
+                    self._restore = None
+                raise
+            self._anchor = actual
+            self._mouse_probe_sent = self._mouse_probe_seen = 0.
             self.capturing = True
 
     def _capture_center(self) -> tuple[int, int]:
@@ -338,6 +389,15 @@ class NativeInput:
             info = MonitorInfo(cbSize=ctypes.sizeof(MonitorInfo))
             if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
                 rect = info.rcMonitor
+                clip = wintypes.RECT()
+                user32.GetClipCursor.argtypes = [ctypes.POINTER(wintypes.RECT)]
+                user32.GetClipCursor.restype = wintypes.BOOL
+                if user32.GetClipCursor(ctypes.byref(clip)):
+                    # Respect other applications' confinement; do not clear it.
+                    rect.left, rect.top = max(rect.left, clip.left), max(rect.top, clip.top)
+                    rect.right, rect.bottom = min(rect.right, clip.right), min(rect.bottom, clip.bottom)
+                    if rect.right - rect.left < 8 or rect.bottom - rect.top < 8:
+                        raise RuntimeError("当前窗口锁定了鼠标，请先解除鼠标锁定再切换电脑。")
                 return ((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)
         elif sys.platform == "darwin":
             q = self._quartz
@@ -537,6 +597,8 @@ class NativeInput:
 
     def _win_mouse(self, msg, data):
         if data.flags & 0x03:
+            if getattr(data, "dwExtraInfo", 0) == self._probe_tag:
+                self._mouse_probe_seen = time.monotonic()
             return False
         x, y = int(data.pt.x), int(data.pt.y)
         capturing = self.capturing

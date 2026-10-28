@@ -1,6 +1,7 @@
 """Packaging regressions that do not invoke a compiler or signing tool."""
 import ast
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -14,6 +15,22 @@ SPEC.loader.exec_module(build)
 
 
 class PackagingTests(unittest.TestCase):
+    def test_update_manifest_matches_native_platform_and_project_version(self):
+        for system, machine, target, relative in (
+            ("win32", "AMD64", "windows-x64", "KMLink/update-manifest.json"),
+            ("darwin", "arm64", "macos-arm64", "KMLink.app/Contents/Resources/update-manifest.json"),
+            ("darwin", "x86_64", "macos-x64", "KMLink.app/Contents/Resources/update-manifest.json"),
+        ):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "pyproject.toml").write_text('[project]\nversion="9.8.7"\n', encoding="utf-8")
+                with patch.object(build, "ROOT", root), patch.object(build.sys, "platform", system), \
+                        patch.object(build.platform, "machine", return_value=machine):
+                    destination = build.write_update_manifest()
+                self.assertEqual(destination, root / "dist" / relative)
+                self.assertEqual(json.loads(destination.read_text()),
+                                 {"schema": 1, "app": "KMLink", "version": "9.8.7", "platform": target})
+
     def test_generated_specs_are_valid_and_platform_specific(self):
         for platform in ("win32", "darwin"):
             with self.subTest(platform=platform):

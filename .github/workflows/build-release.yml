@@ -119,6 +119,10 @@ jobs:
           from pathlib import Path
           executable = Path('dist/KMLink/KMLink.exe') if os.name == 'nt' else Path('dist/KMLink.app/Contents/MacOS/KMLink')
           subprocess.run([str(executable.resolve()), '--smoke-test'], check=True, timeout=25)
+          # Updater CLI must be dispatched before importing/starting the GUI.
+          result = subprocess.run([str(executable.resolve()), '--apply-update', str(Path('build/missing-update-plan.json').resolve())], timeout=25)
+          if result.returncode != 1:
+              raise SystemExit('The frozen update-helper entry did not reject an invalid plan.')
 
       - name: Package platform download
         shell: python
@@ -142,6 +146,25 @@ jobs:
               # Preserve the app's framework symlinks and executable bits.
               subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', 'dist/KMLink.app', str(archive)], check=True)
           print(f'Created {archive} ({archive.stat().st_size:,} bytes)')
+
+      - name: Validate self-update archive
+        shell: python
+        run: |
+          import hashlib
+          import os
+          import subprocess
+          import tempfile
+          import tomllib
+          from pathlib import Path
+          from kmlink.updater import ReleaseUpdate, VerifiedArchive, extract_archive
+          version = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']
+          archive = Path('release-assets') / f'KMLink-{os.environ["KMLINK_PLATFORM"]}.zip'
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          update = ReleaseUpdate(version, 'v' + version, '', '', archive.name, '', archive.stat().st_size, digest, '')
+          with tempfile.TemporaryDirectory(prefix='kmlink-update-check-') as temp:
+              payload = extract_archive(VerifiedArchive(update, archive, digest), Path(temp) / 'payload')
+              if os.name != 'nt':
+                  subprocess.run(['codesign', '--verify', '--deep', '--strict', str(payload)], check=True)
 
       - name: Keep platform downloads
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

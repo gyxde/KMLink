@@ -29,6 +29,7 @@ from .native import NativeInput, enable_dpi_awareness, permissions_status, valid
 from .network import local_ipv4_addresses
 from .pairing import PairingService
 from .transport import generate_pairing_key, normalize_pairing_key
+from .update_ui import UpdatePanel
 
 
 STYLE = """
@@ -112,7 +113,7 @@ def app_icon():
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, enable_discovery=True):
+    def __init__(self, enable_discovery=True, enable_updates=None):
         super().__init__()
         self.setWindowTitle("KMLink · 无界键鼠")
         self.setWindowIcon(app_icon())
@@ -120,6 +121,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(850, 750)
         self._active = False
         self._closing = False
+        self._updates_enabled = enable_discovery if enable_updates is None else enable_updates
         self._log_lines = []
         self._peer_label = None
         self._device_id = str(uuid.uuid4())
@@ -171,6 +173,7 @@ class MainWindow(QMainWindow):
         root = QWidget()
         root.setObjectName("root")
         scroll = QScrollArea()
+        self._page_scroll = scroll
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(root)
@@ -185,12 +188,15 @@ class MainWindow(QMainWindow):
         header.addWidget(brand)
         header.addWidget(label("无界键鼠  /  预览版 " + __version__, "muted"))
         header.addStretch()
+        self.update_button = QPushButton("软件更新")
+        self.update_button.clicked.connect(self._show_updates)
+        header.addWidget(self.update_button)
         self.status = label("尚未连接", "status")
         header.addWidget(self.status)
         outer.addLayout(header)
         hero = QVBoxLayout()
         hero.setSpacing(7)
-        hero.addWidget(label("WINDOWS  ↔  MAC", "eyebrow"))
+        hero.addWidget(label("WINDOWS  ↔  MAC  ↔  ANDROID", "eyebrow"))
         hero.addWidget(label("让两台电脑，共用一套键鼠。", "title"))
         hero.addWidget(label("发现身边的电脑，确认后连接。鼠标跨过屏幕边缘，键盘自动跟随。", "muted"))
         outer.addLayout(hero)
@@ -363,6 +369,9 @@ class MainWindow(QMainWindow):
         self.permission_button.clicked.connect(self._help)
         help_layout.addWidget(self.permission_button)
         aside.addWidget(help_card)
+        self.update_panel = UpdatePanel(self, self._restart_for_update, background=self._updates_enabled)
+        self.update_panel.available.connect(lambda version: self.update_button.setText("更新到 " + version if version else "软件更新"))
+        aside.addWidget(self.update_panel)
         aside.addStretch()
         row.addLayout(aside, 5)
         outer.addLayout(row, 1)
@@ -863,6 +872,7 @@ class MainWindow(QMainWindow):
             event.accept()
             return
         self._closing = True
+        self.update_panel.shutdown()
         self.cursor_indicator.close()
         self._unwatch_screens()
         self.timer.stop()
@@ -870,6 +880,15 @@ class MainWindow(QMainWindow):
         self._stop_services()
         self.engine.stop(announce=False)
         event.accept()
+
+    def _restart_for_update(self):
+        self.close()
+        QApplication.instance().quit()
+
+    def _show_updates(self):
+        self._page_scroll.ensureWidgetVisible(self.update_panel)
+        if self.update_panel._update is None and not self.update_panel._busy:
+            self.update_panel.check(manual=True)
 
 
 def main():

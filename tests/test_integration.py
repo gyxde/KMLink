@@ -54,7 +54,7 @@ class FullSessionTests(unittest.TestCase):
             a.start("controller", "127.0.0.1", port, key, "right")
             wait_for(lambda: a.remote_bounds is not None and b.remote_bounds is not None)
             a.enter_remote(1919, 540)
-            wait_for(lambda: b.receiving)
+            wait_for(lambda: b.receiving and a.remote_active)
             self.assertTrue(sender.capturing)
             self.assertAlmostEqual(receiver.xy[1], 450, delta=1)
             for message in [

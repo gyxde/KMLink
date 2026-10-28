@@ -7,6 +7,7 @@ import queue
 import socket
 import threading
 import time
+import uuid
 from typing import Callable
 
 from .transport import Transport
@@ -17,6 +18,7 @@ SIDES = {"left", "right", "top", "bottom"}
 OPPOSITE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 MAX_CLIPBOARD_BYTES = 64 * 1024
 MAX_TEXT_BYTES = 4096
+POINTER_READY_CAPABILITY = "pointer_ready_v1"
 
 
 def number(value: object, limit: float = 4096) -> float:
@@ -58,6 +60,13 @@ class Engine:
         self._pointer_position = None
         self._pending_position = None
         self._posted_position = None
+        self._peer_pointer_ready = False
+        self._entry_pending = None
+        self._receive_entry = None
+        self._pointer_check_at = 0.
+        self._actual_pointer = None
+        self._actual_motion_at = 0.
+        self._last_remote_motion_at = 0.
 
     def enqueue(self, kind: str, value=None, generation=None):
         try:
@@ -91,6 +100,9 @@ class Engine:
         self._mapped_keys.clear()
         self._scroll_remainder = [0., 0.]
         self._pointer_position = self._pending_position = self._posted_position = None
+        self._peer_pointer_ready = False
+        self._entry_pending = self._receive_entry = None
+        self._actual_pointer = None
         try:
             self.native.set_capturing(False)
             self.native.release_all(last_position)
@@ -126,7 +138,7 @@ class Engine:
                 elif kind == "input":
                     self._input(value)
                 elif kind == "toggle":
-                    if self.remote_active:
+                    if self.remote_active or self._entry_pending:
                         self.return_local()
                     elif self.role == "controller" and self.remote_bounds:
                         self.enter_remote(*self.native.position())
@@ -140,9 +152,64 @@ class Engine:
                 self.changed("error", str(exc)[:240])
         try:
             self._flush_motion()
+            self._check_pointer_health()
         except Exception as exc:
             self.stop()
             self.changed("error", str(exc)[:240])
+
+    @staticmethod
+    def _near(first, second):
+        return max(abs(first[i] - second[i]) for i in (0, 1)) <= 3
+
+    def _check_pointer_health(self):
+        now = time.monotonic()
+        if self._entry_pending and now >= self._entry_pending["deadline"]:
+            self.return_local()
+            self.changed("notice", "对端鼠标未就绪，已保留本机控制，请重新尝试。")
+        if not self.receiving or now < self._pointer_check_at:
+            return
+        self._pointer_check_at = now + .04
+        actual = self.native.position()
+        entry = self._receive_entry
+        if entry:
+            ready = self._near(actual, self._posted_position)
+            # Older peers cannot wait for an ACK. Any observed motion after
+            # their first move also proves the mouse path works.
+            if not entry["id"] and self._last_remote_motion_at > entry["started"]:
+                ready = ready or actual != entry["origin"]
+            if ready:
+                self._receive_entry = None
+                self._actual_pointer = actual
+                self._actual_motion_at = now
+                if entry["id"]:
+                    self._send({"type": "entered", "entry_id": entry["id"]})
+            elif now >= entry["deadline"]:
+                self._release_remote_pointer("鼠标未能进入目标桌面，已返回控制端。")
+            elif now >= entry["retry"]:
+                # SendInput accepting the event is not proof that Windows
+                # applied it. Re-submit a bounded number of initial positions.
+                self.native.move_to(*self._posted_position)
+                entry["retry"] = now + .25
+            return
+        if actual != self._actual_pointer:
+            self._actual_pointer = actual
+            self._actual_motion_at = now
+        elif (self._last_remote_motion_at > self._actual_motion_at
+              and now - self._actual_motion_at >= .8
+              and not self._near(actual, self._posted_position)):
+            self._release_remote_pointer("目标桌面的鼠标移动被限制，已返回控制端。")
+
+    def _release_remote_pointer(self, reason):
+        position = self._posted_position
+        self.receiving = False
+        self._receive_entry = None
+        self._pending_position = None
+        self.native.release_all(position)
+        self._pointer_position = self._posted_position = None
+        self._mapped_keys.clear()
+        rx, ry = self.bounds.ratio(*position)
+        self._send({"type": "return", "rx": rx, "ry": ry, "reason": reason})
+        self.changed("notice", reason)
 
     def _flush_motion(self):
         position, self._pending_position = self._pending_position, None
@@ -153,6 +220,15 @@ class Engine:
     def _send(self, message):
         if not self.transport or not self.transport.send(message):
             raise ConnectionError("连接已中断，已恢复本机控制")
+
+    def _begin_capture(self):
+        if getattr(self.native, "needs_restart", False):
+            # A Windows low-level hook may have been silently removed. Rebuild
+            # both hooks on the next explicit switch after returning locally.
+            self.native.stop()
+            self.native.start()
+            self._native_started = True
+        self.native.set_capturing(True)
 
     def _status(self, state, detail):
         if state == "connected":
@@ -167,7 +243,7 @@ class Engine:
             self._send({"type": "hello", "version": 1, "role": self.role,
                         "name": socket.gethostname()[:80], "platform": platform.system(),
                         "bounds": self.bounds.wire(), "screens": [screen.wire() for screen in self.layout.screens],
-                        "capabilities": ["text_input"]})
+                        "capabilities": ["text_input", POINTER_READY_CAPABILITY]})
             self.changed("handshake", "加密连接已建立，正在确认对端设备")
         elif state in {"error", "disconnected"}:
             self.stop(announce=False)
@@ -189,6 +265,11 @@ class Engine:
             self.remote_bounds = Bounds.parse(msg.get("bounds"))
             self.peer_name = str(msg.get("name", "另一台电脑"))[:80]
             self._peer_platform = str(msg.get("platform", ""))[:32]
+            capabilities = msg.get("capabilities", [])
+            if (not isinstance(capabilities, list) or len(capabilities) > 32
+                    or any(not isinstance(item, str) or len(item) > 64 for item in capabilities)):
+                raise ValueError("对端功能声明无效")
+            self._peer_pointer_ready = POINTER_READY_CAPABILITY in capabilities
             self.changed("ready", f"已连接 {self.peer_name} · F8 切换控制")
             return
         if self.remote_bounds is None:
@@ -202,13 +283,30 @@ class Engine:
                 self.clipboard_write(text)
             return
         if self.role == "controller":
+            if kind == "entered" and self._peer_pointer_ready:
+                entry_id = msg.get("entry_id")
+                if not isinstance(entry_id, str) or len(entry_id) != 32:
+                    raise ValueError("无效的鼠标就绪确认")
+                if self._entry_pending and entry_id == self._entry_pending["id"]:
+                    try:
+                        self._begin_capture()
+                    except RuntimeError as exc:
+                        self.return_local()
+                        self.changed("notice", str(exc))
+                        return
+                    self._entry_pending = None
+                    self.remote_active = True
+                    self.changed("controlling", f"正在控制 {self.peer_name} · F8 或 Ctrl+Alt+Esc 返回")
+                return  # Ignore a late ACK after cancellation or a retry.
             if kind != "return":
                 raise ValueError("对端发送了无效的控制消息")
             rx, ry = number(msg.get("rx"), 1), number(msg.get("ry"), 1)
             if rx < 0 or ry < 0:
                 raise ValueError("无效的返回坐标")
-            if self.remote_active:
+            if self.remote_active or self._entry_pending:
                 self.return_local(rx, ry)
+                if isinstance(msg.get("reason"), str):
+                    self.changed("notice", msg["reason"][:160])
             return
         if kind == "enter":
             side = msg.get("side")
@@ -218,15 +316,26 @@ class Engine:
             if rx < 0 or ry < 0:
                 raise ValueError("无效的进入坐标")
             self.native.release_all(self._posted_position)
+            entry_id = msg.get("entry_id") if self._peer_pointer_ready else None
+            if self._peer_pointer_ready and (not isinstance(entry_id, str)
+                    or len(entry_id) != 32 or any(c not in "0123456789abcdef" for c in entry_id)):
+                raise ValueError("无效的鼠标进入请求")
+            now = time.monotonic()
+            origin = self.native.position()
             self.side = side
             self.receiving = True
             self._pointer_position = self.layout.entry(side, rx, ry)
             self._pending_position = self._pointer_position
             self._flush_motion()
+            self._receive_entry = {"id": entry_id, "origin": origin, "started": now,
+                                   "deadline": now + 1., "retry": now + .1}
+            self._pointer_check_at = 0.
+            self._last_remote_motion_at = now
             self.changed("receiving", "对端正在控制此电脑 · Ctrl+Alt+Esc 停止")
             return
         if kind == "leave":
             self.receiving = False
+            self._receive_entry = None
             self.native.release_all(self._posted_position)
             self._pointer_position = self._posted_position = None
             self._mapped_keys.clear()
@@ -243,6 +352,7 @@ class Engine:
                 raise ValueError("文本输入无效或超过 4 KiB 限制")
             self.native.type_text(text)
         elif kind == "move":
+            self._last_remote_motion_at = time.monotonic()
             dx, dy = number(msg.get("dx")), number(msg.get("dy"))
             # Native injection is asynchronous on macOS and can be queued on
             # Windows. Reading the OS here loses deltas that have not landed yet.
@@ -260,6 +370,7 @@ class Engine:
             if crossed:
                 self._flush_motion()
                 self.receiving = False
+                self._receive_entry = None
                 self.native.release_all(self._posted_position)
                 self._pointer_position = self._posted_position = None
                 self._mapped_keys.clear()
@@ -324,28 +435,37 @@ class Engine:
         return key
 
     def enter_remote(self, x, y):
-        if not self.connected or not self.remote_bounds or self.remote_active:
+        if not self.connected or not self.remote_bounds or self.remote_active or self._entry_pending:
+            return
+        rx, ry = self.bounds.ratio(x, y)
+        if self._peer_pointer_ready:
+            entry_id = uuid.uuid4().hex
+            self._entry_pending = {"id": entry_id, "deadline": time.monotonic() + 1.5}
+            self._send({"type": "enter", "side": self.side, "rx": rx, "ry": ry,
+                        "entry_id": entry_id})
+            self.changed("handshake", "正在确认对端鼠标就绪；键鼠暂留本机。")
             return
         try:
-            self.native.set_capturing(True)
+            self._begin_capture()
         except RuntimeError as exc:
             self._cooldown = time.monotonic() + .7
             self.changed("notice", str(exc))
             return
         self.remote_active = True
-        rx, ry = self.bounds.ratio(x, y)
         self._send({"type": "enter", "side": self.side, "rx": rx, "ry": ry})
         self.changed("controlling", f"正在控制 {self.peer_name} · F8 或 Ctrl+Alt+Esc 返回")
 
     def return_local(self, rx=None, ry=None):
         active = self.remote_active
+        pending = self._entry_pending
+        self._entry_pending = None
         self.remote_active = False
         self.native.set_capturing(False)
         self._mapped_keys.clear()
         self._cooldown = time.monotonic() + .7
-        if active and self.connected:
+        if (active or pending) and self.connected:
             self._send({"type": "leave"})
-        if rx is not None and ry is not None:
+        if active and rx is not None and ry is not None:
             self.native.move_to(*self.layout.entry(OPPOSITE[self.side], rx, ry, inset=28))
         self.changed("ready", "已恢复本机控制 · F8 切到另一台电脑")
 

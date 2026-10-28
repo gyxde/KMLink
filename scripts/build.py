@@ -20,6 +20,28 @@ import tomllib
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def write_update_manifest() -> Path:
+    """Bind a distributed archive to its actual version and native architecture."""
+    machine = platform.machine().lower()
+    architecture = "arm64" if machine in {"arm64", "aarch64"} else "x64" if machine in {"amd64", "x86_64"} else None
+    if sys.platform not in {"win32", "darwin"} or architecture is None:
+        raise ValueError("Unsupported update package platform")
+    if sys.platform == "win32" and architecture != "x64":
+        raise ValueError("Windows downloads currently require x64")
+    with (ROOT / "pyproject.toml").open("rb") as file:
+        version = tomllib.load(file)["project"]["version"]
+    if sys.platform == "win32":
+        destination = ROOT / "dist" / "KMLink" / "update-manifest.json"
+        target = "windows-x64"
+    else:
+        destination = ROOT / "dist" / "KMLink.app" / "Contents" / "Resources" / "update-manifest.json"
+        target = "macos-" + architecture
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps({"schema": 1, "app": "KMLink", "version": version,
+                                       "platform": target}, indent=2) + "\n", encoding="utf-8")
+    return destination
+
+
 def filter_windows_system_icu(binaries):
     """Keep Windows' own ICU shims when Qt imports their unversioned API."""
     from pathlib import Path
@@ -103,7 +125,7 @@ def write_notice_bundle(destination: Path | str | None = None) -> Path:
         if source.is_file():
             copy_file(source, output / "supplementary" / source.name)
 
-    pending = ["PySide6-Essentials", "pynput", "cryptography"]
+    pending = ["PySide6-Essentials", "pynput", "cryptography", "certifi"]
     visited = set()
     while pending:
         requested = pending.pop(0)
@@ -326,6 +348,7 @@ def main() -> int:
         cwd=ROOT, check=True,
     )
     notice_dir = write_notice_bundle(args.notice_dir)
+    write_update_manifest()
     finalize_macos_bundle(notice_dir)
     print(f"Third-party notices: {notice_dir}")
     print(f"Built KMLink for {sys.platform}: {ROOT / 'dist'}")

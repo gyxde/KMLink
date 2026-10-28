@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kmlink"
-version = "0.3.2"
+version = "0.4.0"
 description = "Share a keyboard and mouse between Windows and macOS over a local network"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,6 +14,7 @@ dependencies = [
     "PySide6-Essentials>=6.8,<7",
     "pynput>=1.8.2,<2",
     "cryptography>=44,<51",
+    "certifi>=2024.8.30",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
