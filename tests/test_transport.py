@@ -81,7 +81,8 @@ class TransportTests(unittest.TestCase):
         client.connect("127.0.0.1", server.listening_address[1], key)
         wait_until(lambda: server.is_connected and client.is_connected)
         for transport in (client, server):
-            self.assertEqual(transport._run.sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
+            # Darwin returns its TF_NODELAY bit (4); enabled means nonzero.
+            self.assertNotEqual(transport._run.sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 0)
         messages = ([{"type": "button", "button": "left", "pressed": True}]
                     + [{"type": "move", "dx": n % 7 - 3, "dy": n % 5 - 2} for n in range(700)]
                     + [{"type": "button", "button": "left", "pressed": False},
