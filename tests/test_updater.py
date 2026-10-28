@@ -183,7 +183,7 @@ class ArchiveTests(unittest.TestCase):
 class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.target = self.root / "installed" / "KMLink"
         write_payload(self.target, "1.0.0")
         self.archive = make_archive(self.root / "source")
@@ -283,7 +283,13 @@ class InstallerTests(unittest.TestCase):
     def test_candidate_validation_failure_cleans_only_created_staging_directories(self):
         plan = install.prepare_install(self.archive, parent_pid=12345)
         data = install._load_plan(plan.path)
-        with patch.object(install, "_verify_macos", side_effect=u.UpdateError("invalid candidate")), self.assertRaises(u.UpdateError):
+        candidate_path = install._paths(data)[1]
+        original_validate = install.validate_payload
+        def reject_candidate(root, platform, version):
+            if root == candidate_path:
+                raise u.UpdateError("invalid candidate")
+            return original_validate(root, platform, version)
+        with patch.object(install, "validate_payload", side_effect=reject_candidate), self.assertRaises(u.UpdateError):
             install._transaction(data)
         target, candidate, backup, _ = install._paths(data)
         self.assertFalse(candidate.exists())

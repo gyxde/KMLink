@@ -283,7 +283,8 @@ def _transaction(data: dict) -> None:
         fresh.replace(candidate)
         extracted.rmdir()
         validate_payload(candidate, data["platform"], data["version"])
-        _verify_macos(candidate)
+        if data["platform"].startswith("macos-"):
+            _verify_macos(candidate)
         try:
             target.replace(backup)
             try:
