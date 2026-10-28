@@ -152,10 +152,180 @@ jobs:
           retention-days: 14
           compression-level: 0
 
+  android:
+    name: Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            android/**/*.gradle
+            android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Install Android SDK components
+        shell: python
+        run: |
+          import os
+          import subprocess
+          from pathlib import Path
+          sdk = Path(os.environ['ANDROID_HOME'])
+          modern = sdk / 'cmdline-tools/latest/bin/android'
+          if modern.is_file():
+              subprocess.run([str(modern), '--no-metrics', '--sdk=' + str(sdk), 'sdk', 'install', 'platforms/android-36', 'build-tools/35.0.0', 'platform-tools'], check=True)
+          else:
+              subprocess.run(['sdkmanager', 'platforms;android-36', 'build-tools;35.0.0', 'platform-tools'], check=True)
+          if not (sdk / 'platforms/android-36/android.jar').is_file() or not (sdk / 'build-tools/35.0.0/apksigner').is_file():
+              raise SystemExit('Required Android SDK components were not installed.')
+          Path('android/gradlew').chmod(0o755)
+
+      - name: Set up Python for protocol interoperability tests
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install interoperability test dependency
+        run: python -m pip install 'cryptography>=44,<51'
+
+      - name: Validate Android version
+        shell: python
+        run: |
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']
+          source = Path('android/app/build.gradle').read_text(encoding='utf-8')
+          match = re.search(r'versionName\s+["\']([^"\']+)["\']', source)
+          if not match or match.group(1) != version:
+              raise SystemExit('Android and desktop application versions differ.')
+          if os.environ['GITHUB_REF_TYPE'] == 'tag' and os.environ['GITHUB_REF_NAME'] != 'v' + version:
+              raise SystemExit('Release tag does not match the Android version.')
+
+      - name: Run Android protocol tests
+        working-directory: android
+        run: ./gradlew --no-daemon :protocol:test :app:testDebugUnitTest
+
+      - name: Test real Java and desktop protocol interoperability
+        timeout-minutes: 5
+        shell: python
+        run: |
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+          result = subprocess.run(['./gradlew', '--no-daemon', '-q', ':protocol:printTestRuntimeClasspath'], cwd='android', check=True, capture_output=True, text=True)
+          lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+          if not lines:
+              raise SystemExit('The Java test classpath was not generated.')
+          environment = os.environ.copy()
+          environment['KMLINK_JAVA_CLASSPATH'] = lines[-1]
+          environment['PYTHONPATH'] = str(Path('src').resolve())
+          subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_android_protocol.py', '-v'], env=environment, check=True)
+
+      - name: Run Android emulator startup smoke test
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        timeout-minutes: 15
+        run: bash android/run-emulator-smoke.sh
+
+      - name: Keep Android test reports
+        if: always() && !startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-test-reports
+          path: |
+            android/app/build/reports/androidTests/
+            android/app/build/reports/android-smoke.png
+            android/app/build/reports/qa/
+            android/app/build/reports/emulator.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Restore release signing key
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KMLINK_ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.KMLINK_ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KMLINK_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KMLINK_ANDROID_KEY_PASSWORD }}
+        shell: python
+        run: |
+          import base64
+          import os
+          from pathlib import Path
+          if not all(os.environ.get(key) for key in ('KEYSTORE_BASE64', 'STORE_PASSWORD', 'KEY_ALIAS', 'KEY_PASSWORD')):
+              raise SystemExit('Android release signing secrets are required; refusing to publish an unsigned APK.')
+          key = Path(os.environ['RUNNER_TEMP']) / 'kmlink-android-release.jks'
+          key.write_bytes(base64.b64decode(os.environ['KEYSTORE_BASE64'], validate=True))
+          key.chmod(0o600)
+
+      - name: Build signed release APK
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: android
+        env:
+          KMLINK_ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/kmlink-android-release.jks
+          KMLINK_ANDROID_STORE_PASSWORD: ${{ secrets.KMLINK_ANDROID_STORE_PASSWORD }}
+          KMLINK_ANDROID_KEY_ALIAS: ${{ secrets.KMLINK_ANDROID_KEY_ALIAS }}
+          KMLINK_ANDROID_KEY_PASSWORD: ${{ secrets.KMLINK_ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Build development APK
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        working-directory: android
+        run: ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Verify and collect Android APK
+        shell: python
+        run: |
+          import os
+          import shutil
+          import subprocess
+          from pathlib import Path
+          release = os.environ['GITHUB_REF'].startswith('refs/tags/v')
+          variant = 'release' if release else 'debug'
+          apk = Path(f'android/app/build/outputs/apk/{variant}/app-{variant}.apk')
+          sdk = Path(os.environ['ANDROID_HOME']) / 'build-tools' / '35.0.0'
+          subprocess.run([str(sdk / 'apksigner'), 'verify', '--verbose', str(apk)], check=True)
+          if release:
+              info = subprocess.check_output([str(sdk / 'aapt'), 'dump', 'badging', str(apk)], text=True)
+              if 'application-debuggable' in info:
+                  raise SystemExit('Refusing to publish a debuggable release APK.')
+          output = Path('release-assets')
+          output.mkdir(exist_ok=True)
+          shutil.copyfile(apk, output / 'KMLink-android.apk')
+
+      - name: Remove temporary signing key
+        if: always()
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          (Path(os.environ['RUNNER_TEMP']) / 'kmlink-android-release.jks').unlink(missing_ok=True)
+
+      - name: Keep Android download
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: KMLink-android
+          path: release-assets/KMLink-android.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
   release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, android]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -197,9 +367,11 @@ jobs:
           expected = {f'KMLink-{target}.zip' for target in ('windows-x64', 'macos-arm64', 'macos-x64')}
           if {path.name for path in assets.glob('*.zip')} != expected:
               raise SystemExit('A platform build is missing or unexpected.')
+          if not (assets / 'KMLink-android.apk').is_file():
+              raise SystemExit('The signed Android release APK is missing.')
           source = assets / 'KMLink-source.zip'
           subprocess.run(['git', 'archive', '--format=zip', '--prefix=KMLink/', f'--output={source}', 'HEAD'], check=True)
-          checksums = [f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}' for path in sorted(assets.glob('*.zip'))]
+          checksums = [f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}' for path in sorted(assets.iterdir()) if path.suffix in {'.zip', '.apk'}]
           (assets / 'SHA256SUMS.txt').write_text('\n'.join(checksums) + '\n', encoding='utf-8')
           notes = Path('.github/RELEASE_TEMPLATE.md').read_text(encoding='utf-8')
           notes = notes.replace('@VERSION@', version).replace('@TAG@', tag).replace('@REPOSITORY@', os.environ['GITHUB_REPOSITORY'])

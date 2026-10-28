@@ -248,6 +248,29 @@ class DiscoveryUITests(unittest.TestCase):
         self.assertTrue(any(call[0] == "stop" for call in self.engine.calls))
         self.assertFalse(self.window._active)
 
+    def test_monitor_layout_change_stops_session_and_repositions_cursor(self):
+        from kmlink.geometry import Bounds, DesktopLayout
+        old = DesktopLayout([Bounds(0, 0, 1920, 1080), Bounds(1920, 0, 1920, 1080)])
+        new = DesktopLayout([Bounds(0, 0, 1920, 1080)])
+        self.window._desktop_layout = old
+        self.window._active = True
+        moves = []
+        self.window.native = SimpleNamespace(position=lambda: (3000, 500), move_to=lambda *xy: moves.append(xy))
+        with patch("kmlink.app.query_desktop_layout", return_value=new):
+            self.window._refresh_display_layout()
+        self.assertTrue(any(call[0] == "stop" for call in self.engine.calls))
+        self.assertFalse(self.window._active)
+        self.assertEqual(self.engine.bounds, new.bounds)
+        self.assertEqual(moves, [(1919, 500)])
+        self.assertIn("1 块屏幕", self.window.layout_info.text())
+
+    def test_unchanged_monitor_layout_keeps_connection(self):
+        self.window._active = True
+        with patch("kmlink.app.query_desktop_layout", return_value=self.window._desktop_layout):
+            self.window._refresh_display_layout()
+        self.assertFalse(any(call[0] == "stop" for call in self.engine.calls))
+        self.assertTrue(self.window._active)
+
     def test_close_stops_network_and_input(self):
         self.window.close()
         self.assertTrue(self.window._closing)

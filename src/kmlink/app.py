@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from . import __version__
 from .engine import Bounds, Engine
+from .geometry import query_desktop_layout
 from .discovery import Discovery
 from .native import NativeInput, enable_dpi_awareness, permissions_status, validate_key_code
 from .network import local_ipv4_addresses
@@ -88,14 +89,8 @@ def system_name():
 
 
 def primary_bounds():
-    if sys.platform == "win32":
-        return Bounds(0, 0, ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1))
-    if sys.platform == "darwin":
-        import Quartz
-        rect = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
-        return Bounds(int(rect.origin.x), int(rect.origin.y), int(rect.size.width), int(rect.size.height))
-    rect = QApplication.primaryScreen().geometry()
-    return Bounds(rect.x(), rect.y(), rect.width(), rect.height())
+    """Backward-compatible name: the usable desktop now includes every screen."""
+    return query_desktop_layout().bounds
 
 
 def app_icon():
@@ -146,8 +141,14 @@ class MainWindow(QMainWindow):
             lambda event: self.engine.enqueue("input", event),
             lambda: self.engine.enqueue("toggle"),
             lambda: self.engine.enqueue("emergency"))
-        self.engine = Engine(self.native, primary_bounds(), self._changed,
-                             QApplication.clipboard().setText, validate_key_code)
+        self._desktop_layout = query_desktop_layout()
+        self.engine = Engine(self.native, self._desktop_layout.bounds, self._changed,
+                             QApplication.clipboard().setText, validate_key_code, layout=self._desktop_layout)
+        self._tracked_screens = set()
+        self._watch_screens()
+        self._update_layout_info()
+        QApplication.instance().screenAdded.connect(self._screens_changed)
+        QApplication.instance().screenRemoved.connect(self._screens_changed)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._poll)
         self.timer.start(8)
@@ -333,7 +334,9 @@ class MainWindow(QMainWindow):
             self.side.addItem(title, value)
         self.side.currentIndexChanged.connect(self._layout_changed)
         layout.addWidget(self.side)
-        layout.addWidget(label("由发起连接的一端设置。首版使用双方主屏。", "muted", True))
+        layout.addWidget(label("由发起连接的一端设置。本机屏幕之间不会切换电脑。", "muted", True))
+        self.layout_info = label("正在检测本机显示器…", "muted", True)
+        layout.addWidget(self.layout_info)
         self.clipboard_check = QCheckBox("同步文本剪贴板")
         self.clipboard_check.setChecked(False)
         self.clipboard_check.toggled.connect(self._options_changed)
@@ -368,6 +371,47 @@ class MainWindow(QMainWindow):
         footer.addStretch()
         footer.addWidget(label(socket.gethostname() + "  /  " + platform.system(), "muted"))
         outer.addLayout(footer)
+
+    def _watch_screens(self):
+        for screen in QApplication.screens():
+            if screen not in self._tracked_screens:
+                self._tracked_screens.add(screen)
+                screen.geometryChanged.connect(self._screens_changed)
+                screen.physicalDotsPerInchChanged.connect(self._screens_changed)
+
+    def _screens_changed(self, *args):
+        if not self._closing:
+            QTimer.singleShot(0, self._refresh_display_layout)
+
+    def _update_layout_info(self):
+        bounds = self._desktop_layout.bounds
+        self.layout_info.setText(f"本机 {len(self._desktop_layout.screens)} 块屏幕 · 桌面 {bounds.width} × {bounds.height}\n仅在整组屏幕的外侧边缘切换。")
+
+    def _refresh_display_layout(self):
+        if self._closing:
+            return
+        try:
+            layout = query_desktop_layout()
+        except Exception as exc:
+            self._stop()
+            self._log(f"显示器布局读取失败，已停止共享：{exc}")
+            return
+        self._watch_screens()
+        if layout.screens == self._desktop_layout.screens:
+            return
+        if self._active or self._request_id:
+            self._stop()
+        self._desktop_layout = layout
+        self.engine.layout, self.engine.bounds = layout, layout.bounds
+        try:
+            position = self.native.position()
+            target = layout.clamp(*position)
+            if target != position:
+                self.native.move_to(*target)
+        except RuntimeError:
+            pass  # Native devices are initialized only after connecting.
+        self._update_layout_info()
+        self._log("显示器布局已更新；如刚才正在共享，请重新连接。")
 
     def _queue_service(self, category, kind, data, generation=None):
         generation = self._service_generation if generation is None else generation
@@ -779,7 +823,7 @@ class MainWindow(QMainWindow):
             "Mac：系统设置 → 隐私与安全性 → 为 KMLink 开启「辅助功能」和「输入监控」。"
             "如果系统询问本地网络访问，请允许。授权后退出程序再打开。源码启动时授权对象可能是 Terminal / Python。\n\n"
             "F8（Mac 可能需要 Fn+F8）切换控制；Ctrl+Alt+Esc 紧急收回。切换前请松开按键和鼠标按钮。\n\n"
-            "预览版仅支持两台电脑的主屏与文本剪贴板；不支持文件拖放、登录/UAC 安全桌面。"
+            "预览版支持两台电脑的多屏桌面与文本剪贴板；不支持文件拖放、登录/UAC 安全桌面。"
             "两端都需运行 KMLink。关闭窗口会停止共享。")
 
     def closeEvent(self, event):

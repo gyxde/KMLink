@@ -1,0 +1,49 @@
+plugins {
+    id 'com.android.application'
+}
+
+def releaseSigningAvailable = ['KMLINK_ANDROID_KEYSTORE_PATH', 'KMLINK_ANDROID_STORE_PASSWORD', 'KMLINK_ANDROID_KEY_ALIAS', 'KMLINK_ANDROID_KEY_PASSWORD'].every { System.getenv(it) }
+
+android {
+    namespace 'io.kmlink.android'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'io.kmlink.android'
+        minSdk 26
+        targetSdk 36
+        versionCode 3
+        versionName '0.3.0'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    signingConfigs {
+        release {
+            if (releaseSigningAvailable) {
+                storeType 'PKCS12'
+                storeFile file(System.getenv('KMLINK_ANDROID_KEYSTORE_PATH'))
+                storePassword System.getenv('KMLINK_ANDROID_STORE_PASSWORD')
+                keyAlias System.getenv('KMLINK_ANDROID_KEY_ALIAS') ?: 'kmlink'
+                keyPassword System.getenv('KMLINK_ANDROID_KEY_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (releaseSigningAvailable) signingConfig signingConfigs.release
+        }
+    }
+    testOptions { unitTests.returnDefaultValues = true }
+}
+
+dependencies {
+    implementation project(':protocol')
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test:core:1.6.1'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+}

@@ -15,3 +15,9 @@ artifacts/
 .tools/
 release-assets/
 release-notes.md
+.private/
+android/.gradle/
+android/local.properties
+android/**/build/
+*.jks
+*.keystore

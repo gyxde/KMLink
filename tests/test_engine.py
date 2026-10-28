@@ -4,6 +4,7 @@ import platform
 import unittest
 
 from kmlink.engine import Bounds, Engine, MAX_CLIPBOARD_BYTES
+from kmlink.geometry import DesktopLayout
 from kmlink.native import validate_key_code
 
 
@@ -54,6 +55,9 @@ class FakeNative:
     def scroll(self, dx, dy):
         self.calls.append(("scroll", dx, dy))
 
+    def type_text(self, text):
+        self.calls.append(("text", text))
+
 
 class FakeTransport:
     def __init__(self, on_message, on_status):
@@ -81,7 +85,7 @@ class FakeTransport:
 
 
 class EngineTests(unittest.TestCase):
-    def build(self, role="controller", side="right", handshake=True):
+    def build(self, role="controller", side="right", handshake=True, layout=None):
         native = FakeNative()
         statuses, clipboards, transports = [], [], []
 
@@ -92,7 +96,7 @@ class EngineTests(unittest.TestCase):
 
         engine = Engine(native, Bounds(0, 0, 1000, 600),
                         lambda state, detail: statuses.append((state, detail)),
-                        clipboards.append, validate_key_code, factory)
+                        clipboards.append, validate_key_code, factory, layout=layout)
         engine.start(role, "127.0.0.1", 24801, "unused by fake", side)
         transport = transports[-1]
         transport.on_status("connected", "connected")
@@ -113,6 +117,76 @@ class EngineTests(unittest.TestCase):
     def message(self, engine, transport, message):
         transport.on_message(message)
         engine.poll()
+
+    def test_mobile_text_requires_active_receiver_and_valid_payload(self):
+        engine, native, transport, _, _, _ = self.build("receiver")
+        self.message(engine, transport, {"type": "text", "text": "ignored"})
+        self.assertFalse(any(call[0] == "text" for call in native.calls))
+        self.message(engine, transport, {"type": "enter", "side": "right", "rx": 0.5, "ry": 0.5})
+        self.message(engine, transport, {"type": "text", "text": "中文\nHello\t🙂"})
+        self.assertIn(("text", "中文\nHello\t🙂"), native.calls)
+        self.assertTrue(engine.connected)
+        self.assertIn("text_input", transport.sent[0]["capabilities"])
+        for invalid in ("x" * 4097, "secret\x00", "\x1b", 42):
+            engine, native, transport, _, _, _ = self.build("receiver")
+            self.message(engine, transport, {"type": "enter", "side": "right", "rx": .5, "ry": .5})
+            self.message(engine, transport, {"type": "text", "text": invalid})
+            self.assertFalse(engine.connected)
+            self.assertFalse(any(call[0] == "text" for call in native.calls))
+
+    def test_android_modifier_keys_are_not_swapped(self):
+        engine, _, _, _, _, _ = self.build()
+        engine.map_ctrl_cmd = True
+        engine._peer_platform = "Android"
+        self.assertEqual(engine._map_key("named:ctrl_l"), "named:ctrl_l")
+        self.assertEqual(engine._map_key("named:cmd_l"), "named:cmd_l")
+
+    def test_local_monitor_boundary_does_not_transfer_control(self):
+        layout = DesktopLayout([Bounds(0, 0, 1920, 1080), Bounds(1920, 0, 1920, 1080)])
+        engine, native, transport, _, _, _ = self.build(layout=layout)
+        engine._cooldown = 0
+        for x in (1918, 1919, 1920, 1921, 2600):
+            engine.enqueue("input", {"type": "local_move", "x": x, "y": 500})
+            engine.poll()
+            self.assertFalse(engine.remote_active, f"Internal monitor edge {x} must stay local")
+            self.assertFalse(native.capturing)
+        engine.enqueue("input", {"type": "local_move", "x": 3839, "y": 500})
+        engine.poll()
+        self.assertTrue(engine.remote_active)
+        self.assertTrue(native.capturing)
+        self.message(engine, transport, {"type": "return", "rx": 0, "ry": .5})
+        self.assertFalse(engine.remote_active)
+        self.assertFalse(native.capturing)
+        self.assertGreater(native.xy[0], 1920)
+        self.assertTrue(layout.contains(*native.xy))
+
+    def test_receiver_mouse_crosses_its_internal_monitor_boundary(self):
+        layout = DesktopLayout([Bounds(-1280, 0, 1280, 1024), Bounds(0, 0, 1920, 1080)])
+        engine, native, transport, _, _, _ = self.build("receiver", layout=layout)
+        self.message(engine, transport, {"type": "enter", "side": "right", "rx": .5, "ry": .5})
+        native.xy = (-2, 500)
+        self.message(engine, transport, {"type": "move", "dx": 10, "dy": 0})
+        self.assertEqual(native.xy, (8, 500))
+        self.assertTrue(engine.receiving)
+        self.assertFalse(any(m["type"] == "return" for m in transport.sent))
+        native.xy = (-1279, 500)
+        self.message(engine, transport, {"type": "move", "dx": -10, "dy": 0})
+        self.assertFalse(engine.receiving)
+        self.assertEqual(transport.sent[-1]["type"], "return")
+
+    def test_multimonitor_hello_advertises_complete_desktop(self):
+        layout = DesktopLayout([Bounds(0, -1080, 1920, 1080), Bounds(0, 0, 1920, 1080)])
+        engine, _, transport, _, _, _ = self.build(layout=layout)
+        self.assertEqual(transport.sent[0]["bounds"], {"x": 0, "y": -1080, "width": 1920, "height": 2160})
+        self.assertEqual(len(transport.sent[0]["screens"]), 2)
+        engine._cooldown = 0
+        engine.side = "top"
+        engine.enqueue("input", {"type": "local_move", "x": 900, "y": 0})
+        engine.poll()
+        self.assertFalse(engine.remote_active)
+        engine.enqueue("input", {"type": "local_move", "x": 900, "y": -1080})
+        engine.poll()
+        self.assertTrue(engine.remote_active)
 
     def test_hello_advertises_local_role_and_bounds(self):
         engine, native, transport, statuses, _, _ = self.build()

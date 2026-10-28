@@ -362,6 +362,16 @@ class NativeInput:
             (self._keyboard.press if pressed else self._keyboard.release)(key)
         (self._injected_keys.add if pressed else self._injected_keys.discard)(code)
 
+    def type_text(self, text: str) -> None:
+        """Insert text from the paired mobile controller without held modifiers."""
+        if self._keyboard is None:
+            return
+        self.release_all()
+        for character in text:
+            code = {"\n": "named:enter", "\t": "named:tab"}.get(character, "char:" + character)
+            self.key(code, True)
+            self.key(code, False)
+
     def release_all(self) -> None:
         for code in list(self._injected_keys):
             try:

@@ -7,55 +7,16 @@ import queue
 import socket
 import threading
 import time
-from dataclasses import dataclass
 from typing import Callable
 
 from .transport import Transport
-
-
-@dataclass(frozen=True)
-class Bounds:
-    x: int
-    y: int
-    width: int
-    height: int
-
-    def wire(self) -> dict:
-        return {"x": self.x, "y": self.y, "width": self.width, "height": self.height}
-
-    @classmethod
-    def parse(cls, value: object) -> "Bounds":
-        if not isinstance(value, dict):
-            raise ValueError("无效的屏幕信息")
-        parts = [value.get(k) for k in ("x", "y", "width", "height")]
-        if any(type(v) is not int for v in parts):
-            raise ValueError("无效的屏幕坐标")
-        x, y, w, h = parts
-        if not (64 <= w <= 65536 and 64 <= h <= 65536 and abs(x) <= 131072 and abs(y) <= 131072):
-            raise ValueError("屏幕尺寸超出范围")
-        return cls(x, y, w, h)
-
-    def ratio(self, x: float, y: float) -> tuple[float, float]:
-        return (max(0., min(1., (x - self.x) / (self.width - 1))),
-                max(0., min(1., (y - self.y) / (self.height - 1))))
-
-    def entry(self, side: str, rx: float, ry: float, inset: int = 16) -> tuple[int, int]:
-        x = self.x + round(rx * (self.width - 1))
-        y = self.y + round(ry * (self.height - 1))
-        if side == "right":
-            x = self.x + inset
-        elif side == "left":
-            x = self.x + self.width - 1 - inset
-        elif side == "bottom":
-            y = self.y + inset
-        else:
-            y = self.y + self.height - 1 - inset
-        return x, y
+from .geometry import Bounds, DesktopLayout
 
 
 SIDES = {"left", "right", "top", "bottom"}
 OPPOSITE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 MAX_CLIPBOARD_BYTES = 64 * 1024
+MAX_TEXT_BYTES = 4096
 
 
 def number(value: object, limit: float = 4096) -> float:
@@ -67,9 +28,10 @@ def number(value: object, limit: float = 4096) -> float:
 class Engine:
     def __init__(self, native, bounds: Bounds, changed: Callable[[str, str], None],
                  clipboard_write: Callable[[str], None], key_validator: Callable[[str], bool],
-                 transport_factory=Transport):
+                 transport_factory=Transport, layout=None):
         self.native = native
-        self.bounds = bounds
+        self.layout = layout or DesktopLayout([bounds])
+        self.bounds = self.layout.bounds
         self.changed = changed
         self.clipboard_write = clipboard_write
         self.key_validator = key_validator
@@ -188,7 +150,8 @@ class Engine:
                 raise
             self._send({"type": "hello", "version": 1, "role": self.role,
                         "name": socket.gethostname()[:80], "platform": platform.system(),
-                        "bounds": self.bounds.wire()})
+                        "bounds": self.bounds.wire(), "screens": [screen.wire() for screen in self.layout.screens],
+                        "capabilities": ["text_input"]})
             self.changed("handshake", "加密连接已建立，正在确认对端设备")
         elif state in {"error", "disconnected"}:
             self.stop(announce=False)
@@ -238,7 +201,7 @@ class Engine:
             self.native.release_all()
             self.side = side
             self.receiving = True
-            self.native.move_to(*self.bounds.entry(side, rx, ry))
+            self.native.move_to(*self.layout.entry(side, rx, ry))
             self.changed("receiving", "对端正在控制此电脑 · Ctrl+Alt+Esc 停止")
             return
         if kind == "leave":
@@ -247,17 +210,23 @@ class Engine:
             self._mapped_keys.clear()
             self.changed("ready", f"已连接 {self.peer_name} · 等待对端控制")
             return
-        if kind not in {"move", "button", "scroll", "key"}:
+        if kind not in {"move", "button", "scroll", "key", "text"}:
             raise ValueError("收到未知的控制消息")
         if not self.receiving:
             return  # in-flight input after returning across an edge
-        if kind == "move":
+        if kind == "text":
+            text = msg.get("text")
+            if (not isinstance(text, str) or len(text.encode("utf-8")) > MAX_TEXT_BYTES
+                    or any(not ch.isprintable() and ch not in "\n\t" for ch in text)):
+                raise ValueError("文本输入无效或超过 4 KiB 限制")
+            self.native.type_text(text)
+        elif kind == "move":
             dx, dy = number(msg.get("dx")), number(msg.get("dy"))
             x, y = self.native.position()
-            # Keep the pointer within the advertised primary screen.
-            x = max(self.bounds.x, min(self.bounds.x + self.bounds.width - 1, x + dx))
-            y = max(self.bounds.y, min(self.bounds.y + self.bounds.height - 1, y + dy))
-            self.native.move_to(round(x), round(y))
+            # Project gaps in an irregular monitor layout onto a real screen.
+            # Internal monitor borders remain traversable in the same session.
+            x, y = self.layout.clamp(x + dx, y + dy)
+            self.native.move_to(x, y)
             crossed = ((self.side == "right" and dx < 0 and x <= self.bounds.x) or
                        (self.side == "left" and dx > 0 and x >= self.bounds.x + self.bounds.width - 1) or
                        (self.side == "bottom" and dy < 0 and y <= self.bounds.y) or
@@ -295,16 +264,7 @@ class Engine:
             if self.remote_active or time.monotonic() < self._cooldown:
                 return
             x, y = event["x"], event["y"]
-            b = self.bounds
-            # Do not switch from a corner or another display.
-            inside = b.x <= x < b.x+b.width and b.y <= y < b.y+b.height
-            horizontal = b.y + 24 < y < b.y + b.height - 25
-            vertical = b.x + 24 < x < b.x + b.width - 25
-            hit = ((self.side == "right" and x >= b.x+b.width-2 and horizontal) or
-                   (self.side == "left" and x <= b.x+1 and horizontal) or
-                   (self.side == "bottom" and y >= b.y+b.height-2 and vertical) or
-                   (self.side == "top" and y <= b.y+1 and vertical))
-            if inside and hit:
+            if self.layout.hits_outer_edge(self.side, x, y):
                 self.enter_remote(x, y)
         elif self.remote_active:
             outgoing = dict(event)
@@ -319,7 +279,9 @@ class Engine:
             self._send(outgoing)
 
     def _map_key(self, key):
-        if self.map_ctrl_cmd and self._peer_platform != platform.system():
+        if (self.map_ctrl_cmd and self._peer_platform in {"Windows", "Darwin"}
+                and platform.system() in {"Windows", "Darwin"}
+                and self._peer_platform != platform.system()):
             for suffix in ("", "_l", "_r"):
                 if key == "named:ctrl" + suffix:
                     return "named:cmd" + suffix
@@ -350,7 +312,7 @@ class Engine:
         if active and self.connected:
             self._send({"type": "leave"})
         if rx is not None and ry is not None:
-            self.native.move_to(*self.bounds.entry(OPPOSITE[self.side], rx, ry, inset=28))
+            self.native.move_to(*self.layout.entry(OPPOSITE[self.side], rx, ry, inset=28))
         self.changed("ready", "已恢复本机控制 · F8 切到另一台电脑")
 
     def clipboard_changed(self, text: str):

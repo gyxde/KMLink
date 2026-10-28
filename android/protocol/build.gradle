@@ -1,0 +1,14 @@
+plugins { id 'java-library' }
+java { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+dependencies {
+    compileOnly 'org.json:json:20240303'
+    testImplementation 'org.json:json:20240303'
+    testImplementation 'junit:junit:4.13.2'
+}
+test { useJUnit() }
+tasks.register('printTestRuntimeClasspath') {
+    dependsOn testClasses
+    doLast { println sourceSets.test.runtimeClasspath.asPath }
+}
+
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">KMLink</string>
+    <string name="accessibility_description">允许你确认配对的电脑在屏幕解锁时点击、滑动和输入文字。屏幕上会显示控制光标，可随时通过通知停止。不会录制或传送屏幕，不读取密码框。仅在你启用并同意连接后生效。</string>
+</resources>

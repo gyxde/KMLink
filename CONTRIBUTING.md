@@ -8,7 +8,7 @@
 python -m unittest discover -s tests -v
 ```
 
-发布版本时，同步更新 `pyproject.toml` 的版本和 `src/kmlink/__init__.py` 的 `__version__`。在 `main` 对应提交创建 `vX.Y.Z` 标签并推送，GitHub Actions 会分别构建 Windows x64、Mac arm64 和 Mac Intel，然后创建 Release。不要移动已经发布的版本标签；修复需要发布新版本。
+发布版本时，同步更新 `pyproject.toml` 的版本和 `src/kmlink/__init__.py` 的 `__version__`，以及 `android/app/build.gradle` 的 `versionName` / 递增的 `versionCode`。在 `main` 对应提交创建 `vX.Y.Z` 标签并推送，GitHub Actions 会分别构建 Windows x64、Mac arm64 和 Mac Intel，然后创建 Release。不要移动已经发布的版本标签；修复需要发布新版本。
 
 ```bash
 git switch main

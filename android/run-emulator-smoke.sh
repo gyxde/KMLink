@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+SDK="${ANDROID_HOME:?ANDROID_HOME must point to the Android SDK}"
+REPORTS="$PROJECT_ROOT/android/app/build/reports"
+mkdir -p "$REPORTS"
+MODERN="$SDK/cmdline-tools/latest/bin/android"
+if [[ -x "$MODERN" ]]; then
+  "$MODERN" --no-metrics --sdk="$SDK" sdk install emulator system-images/android-35/google_apis/x86_64
+else
+  sdkmanager "emulator" "system-images;android-35;google_apis;x86_64"
+fi
+if [[ ! -e /dev/kvm ]]; then
+  echo "The Android emulator smoke test requires the runner's KVM device." >&2
+  exit 1
+fi
+sudo chmod 666 /dev/kvm
+AVDMANAGER="$SDK/cmdline-tools/latest/bin/avdmanager"
+printf 'no\n' | "$AVDMANAGER" create avd --force --name kmlink-smoke --package "system-images;android-35;google_apis;x86_64" --device pixel_5
+export ANDROID_SERIAL=emulator-5554
+"$SDK/platform-tools/adb" start-server
+"$SDK/emulator/emulator" -avd kmlink-smoke -port 5554 -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect -accel on -cores 2 -memory 2048 > "$REPORTS/emulator.log" 2>&1 &
+EMULATOR_PID=$!
+cleanup() {
+  "$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" emu kill >/dev/null 2>&1 || true
+  kill "$EMULATOR_PID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+BOOTED=0
+DEADLINE=$((SECONDS + 120))
+while (( SECONDS < DEADLINE )); do
+  if [[ "$(timeout 5 "$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == "1" ]]; then
+    BOOTED=1
+    break
+  fi
+  if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+    tail -n 100 "$REPORTS/emulator.log"
+    exit 1
+  fi
+  sleep 2
+done
+if [[ "$BOOTED" != "1" ]]; then
+  tail -n 100 "$REPORTS/emulator.log"
+  echo "Android emulator did not boot within the bounded wait." >&2
+  exit 1
+fi
+"$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" shell input keyevent 82
+cd "$PROJECT_ROOT/android"
+./gradlew --no-daemon :app:connectedDebugAndroidTest
+"$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" pull /sdcard/Android/data/io.kmlink.android/files/qa "$REPORTS/qa" >/dev/null 2>&1 || true
+"$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" shell am start -W -n io.kmlink.android/.MainActivity >/dev/null
+"$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" exec-out screencap -p > "$REPORTS/android-smoke.png"
