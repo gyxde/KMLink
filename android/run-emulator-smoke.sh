@@ -45,6 +45,9 @@ export ANDROID_SERIAL=emulator-5554
 "$SDK/emulator/emulator" -avd kmlink-smoke -port 5554 -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect -accel on -cores 2 -memory 2048 > "$REPORTS/emulator.log" 2>&1 &
 EMULATOR_PID=$!
 cleanup() {
+  # Preserve runtime evidence even when Gradle returns a test failure.
+  timeout 10 "$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" logcat -d -v threadtime > "$REPORTS/logcat.txt" 2>&1 || true
+  timeout 10 "$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" pull /sdcard/Android/data/io.kmlink.android/files/qa "$REPORTS/qa" >/dev/null 2>&1 || true
   "$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" emu kill >/dev/null 2>&1 || true
   kill "$EMULATOR_PID" >/dev/null 2>&1 || true
 }
@@ -70,6 +73,5 @@ fi
 "$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" shell input keyevent 82
 cd "$PROJECT_ROOT/android"
 ./gradlew --no-daemon :app:connectedDebugAndroidTest
-"$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" pull /sdcard/Android/data/io.kmlink.android/files/qa "$REPORTS/qa" >/dev/null 2>&1 || true
 "$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" shell am start -W -n io.kmlink.android/.MainActivity >/dev/null
 "$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" exec-out screencap -p > "$REPORTS/android-smoke.png"

@@ -256,6 +256,8 @@ jobs:
             android/app/build/reports/android-smoke.png
             android/app/build/reports/qa/
             android/app/build/reports/emulator.log
+            android/app/build/reports/logcat.txt
+            android/app/build/outputs/androidTest-results/
           if-no-files-found: ignore
           retention-days: 14
 
