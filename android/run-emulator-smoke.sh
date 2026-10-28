@@ -73,5 +73,3 @@ fi
 "$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" shell input keyevent 82
 cd "$PROJECT_ROOT/android"
 ./gradlew --no-daemon :app:connectedDebugAndroidTest
-"$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" shell am start -W -n io.kmlink.android/.MainActivity >/dev/null
-"$SDK/platform-tools/adb" -s "$ANDROID_SERIAL" exec-out screencap -p > "$REPORTS/android-smoke.png"
