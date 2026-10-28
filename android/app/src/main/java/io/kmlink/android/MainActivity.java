@@ -44,7 +44,7 @@ public final class MainActivity extends Activity implements LinkService.Observer
         updater=new UpdateController(this,(message,action,busy,available)->{
             updateStatus.setText(message);updateBusy=busy;updateAvailable=available;
             updateInstall.setText(action);renderUpdateButtons();
-        },()->{if(service!=null)service.stopNetwork();},this::updatesAllowed);
+        },()->{LinkService active=UpdateSessionGuard.active(service,LinkService::current);if(active!=null)active.stopNetwork();},this::updatesAllowed);
     }
     @Override protected void onStart(){super.onStart();bound=bindService(new Intent(this,LinkService.class),connection,Context.BIND_AUTO_CREATE);}
     @Override protected void onResume(){super.onResume();foreground=true;if(updater!=null)updater.resume();render();}
@@ -144,7 +144,9 @@ public final class MainActivity extends Activity implements LinkService.Observer
         if(foreground&&pending!=null&&!pending.id.equals(dialogId))showPairing(pending);if(pending==null&&dialog!=null)dismissDialog();
         renderUpdateButtons();
     }
-    private boolean updatesAllowed(){return service==null||(!service.isConnected()&&service.pending()==null);}
+    private boolean updatesAllowed(){
+        return UpdateSessionGuard.allowsUpdate(service,LinkService::current,s->s.isConnected()||s.pending()!=null);
+    }
     private void renderUpdateButtons(){
         if(updateCheck==null)return;boolean local=updatesAllowed();
         updateCheck.setEnabled(local&&!updateBusy);updateInstall.setEnabled(local&&updateAvailable&&!updateBusy);updateCancel.setEnabled(local&&updateBusy);
