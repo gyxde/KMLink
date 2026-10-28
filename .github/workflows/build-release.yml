@@ -78,6 +78,29 @@ jobs:
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
               summary.write(f'KMLink {version} - {os.environ["KMLINK_PLATFORM"]}\n')
 
+      - name: Build Intel macOS crypto with static OpenSSL
+        if: matrix.platform == 'macos-x64'
+        shell: python
+        run: |
+          import os
+          import re
+          import subprocess
+          import sys
+          import tomllib
+          from pathlib import Path
+          requirements = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['dependencies']
+          requirement = next(item for item in requirements if item.startswith('cryptography'))
+          environment = os.environ.copy()
+          environment['OPENSSL_DIR'] = subprocess.check_output(['brew', '--prefix', 'openssl@3'], text=True).strip()
+          environment['OPENSSL_STATIC'] = '1'
+          # Ignore cached dynamic wheels from an earlier macOS build.
+          subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', '--force-reinstall', '--no-binary=cryptography', requirement], env=environment, check=True)
+          from cryptography.hazmat.bindings import _rust
+          libraries = subprocess.check_output(['otool', '-L', _rust.__file__], text=True)
+          print(libraries)
+          if re.search(r'lib(?:ssl|crypto)[^/\n]*\.dylib', libraries, re.IGNORECASE):
+              raise SystemExit('Intel cryptography must statically link OpenSSL before packaging.')
+
       - name: Install runtime and build dependencies
         run: python -m pip install ".[build]"
 

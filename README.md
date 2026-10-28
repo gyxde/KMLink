@@ -11,11 +11,11 @@ KMLink 是参考 Mouse Without Borders 使用方式开发的 Windows / macOS 桌
 | 平台 | 直接下载 |
 | --- | --- |
 | Windows 64 位 | [KMLink-windows-x64.zip](https://github.com/gyxde/KMLink/releases/latest/download/KMLink-windows-x64.zip) |
-| Mac Apple Silicon（M1/M2/M3/M4 等） | [KMLink-macos-arm64.zip](https://github.com/gyxde/KMLink/releases/latest/download/KMLink-macos-arm64.zip) |
-| Mac Intel | [KMLink-macos-x64.zip](https://github.com/gyxde/KMLink/releases/latest/download/KMLink-macos-x64.zip) |
+| Mac Apple Silicon（M1/M2/M3/M4 等，macOS 14+） | [KMLink-macos-arm64.zip](https://github.com/gyxde/KMLink/releases/latest/download/KMLink-macos-arm64.zip) |
+| Mac Intel（macOS 14+） | [KMLink-macos-x64.zip](https://github.com/gyxde/KMLink/releases/latest/download/KMLink-macos-x64.zip) |
 | 完整源码 | [KMLink-source.zip](https://github.com/gyxde/KMLink/releases/latest/download/KMLink-source.zip) |
 
-Windows 解压后保留整个 `KMLink` 文件夹，运行 `KMLink.exe`。Mac 解压后将 `KMLink.app` 放入“应用程序”。Mac 包带有临时本机签名，尚无 Apple Developer ID 签名或公证，首次启动可能需要你在系统设置中确认打开。使用前仍需授予辅助功能、输入监控及本地网络权限。
+当前提供的 Mac 预编译包要求 **macOS 14 或以上**。Windows 解压后保留整个 `KMLink` 文件夹，运行 `KMLink.exe`。Mac 解压后将 `KMLink.app` 放入“应用程序”。Mac 包带有临时本机签名，尚无 Apple Developer ID 签名或公证，首次启动可能需要你在系统设置中确认打开。使用前仍需授予辅助功能、输入监控及本地网络权限。
 
 ## 分支与发布
 
@@ -124,6 +124,15 @@ KMLINK_PYTHON=/path/to/python3 bash scripts/setup.sh
 
 ```bash
 # macOS
+.venv/bin/python scripts/build.py
+```
+
+Intel Mac 在本地打包前，需要静态链接 cryptography 的 OpenSSL，避免它与 Python 自带的同名动态库冲突（GitHub Actions 已自动处理）。安装 Homebrew 的 `openssl@3` 后执行：
+
+```bash
+OPENSSL_DIR="$(brew --prefix openssl@3)" OPENSSL_STATIC=1 \
+  .venv/bin/python -m pip install --no-cache-dir --force-reinstall \
+  --no-binary cryptography 'cryptography>=44,<51'
 .venv/bin/python scripts/build.py
 ```
 
