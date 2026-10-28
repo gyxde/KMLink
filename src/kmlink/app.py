@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .cursor import RemoteCursorIndicator
 from .engine import Bounds, Engine
 from .geometry import query_desktop_layout
 from .discovery import Discovery
@@ -144,6 +145,7 @@ class MainWindow(QMainWindow):
         self._desktop_layout = query_desktop_layout()
         self.engine = Engine(self.native, self._desktop_layout.bounds, self._changed,
                              QApplication.clipboard().setText, validate_key_code, layout=self._desktop_layout)
+        self.cursor_indicator = RemoteCursorIndicator(self, self.native.cursor_visible)
         self._tracked_screens = set()
         self._display_timer = QTimer(self)
         self._display_timer.setSingleShot(True)
@@ -153,6 +155,7 @@ class MainWindow(QMainWindow):
         QApplication.instance().screenAdded.connect(self._screens_changed)
         QApplication.instance().screenRemoved.connect(self._screens_changed)
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self._poll)
         self.timer.start(8)
         self.clipboard_timer = QTimer(self)
@@ -488,6 +491,7 @@ class MainWindow(QMainWindow):
                     self._clear_request(self._request_id)
                 self._log(f"设备连接失败：{exc}")
         self.engine.poll()
+        self.cursor_indicator.update_receiving(self.engine.receiving)
         if self._auto_receiver_deadline and time.monotonic() >= self._auto_receiver_deadline:
             self._stop()
             self._changed("error", "对方未完成连接，已停止等待。请重新申请。")
@@ -794,6 +798,7 @@ class MainWindow(QMainWindow):
     def _set_active(self, active):
         self._active = active
         if not active:
+            self.cursor_indicator.update_receiving(False)
             self._auto_receiver_deadline = 0.
         busy = active or self._request_id is not None
         self.tabs.tabBar().setEnabled(not busy)
@@ -858,6 +863,7 @@ class MainWindow(QMainWindow):
             event.accept()
             return
         self._closing = True
+        self.cursor_indicator.close()
         self._unwatch_screens()
         self.timer.stop()
         self.clipboard_timer.stop()

@@ -25,6 +25,77 @@ NAMED_KEYS = frozenset({
 BUTTONS = frozenset({"left", "right", "middle"})
 
 
+class _WindowsMouse:
+    """Lazy Win32 mouse input API with physical virtual-desktop coordinates."""
+
+    def __init__(self):
+        # Fixed-width types also keep mocked API tests correct on non-Windows
+        # hosts, where C long is not necessarily the Win32 32-bit LONG type.
+        long, dword, word = ctypes.c_int32, ctypes.c_uint32, ctypes.c_uint16
+
+        class Point(ctypes.Structure):
+            _fields_ = [("x", long), ("y", long)]
+
+        class MouseInput(ctypes.Structure):
+            _fields_ = [("dx", long), ("dy", long), ("mouseData", dword),
+                        ("dwFlags", dword), ("time", dword),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+
+        class KeyboardInput(ctypes.Structure):
+            _fields_ = [("wVk", word), ("wScan", word), ("dwFlags", dword),
+                        ("time", dword), ("dwExtraInfo", ctypes.c_size_t)]
+
+        class HardwareInput(ctypes.Structure):
+            _fields_ = [("uMsg", dword), ("wParamL", word), ("wParamH", word)]
+
+        class InputUnion(ctypes.Union):
+            _fields_ = [("mi", MouseInput), ("ki", KeyboardInput), ("hi", HardwareInput)]
+
+        class Input(ctypes.Structure):
+            _anonymous_ = ("payload",)
+            _fields_ = [("type", dword), ("payload", InputUnion)]
+
+        class CursorInfo(ctypes.Structure):
+            _fields_ = [("cbSize", dword), ("flags", dword),
+                        ("hCursor", ctypes.c_void_p), ("ptScreenPos", Point)]
+
+        self.Input, self.MouseInput, self.CursorInfo = Input, MouseInput, CursorInfo
+        self.api = ctypes.WinDLL("user32", use_last_error=True)
+        self.api.SendInput.argtypes = [dword, ctypes.POINTER(Input), ctypes.c_int]
+        self.api.SendInput.restype = dword
+        self.api.GetSystemMetrics.argtypes = [ctypes.c_int]
+        self.api.GetSystemMetrics.restype = ctypes.c_int
+        self.api.GetCursorInfo.argtypes = [ctypes.POINTER(CursorInfo)]
+        self.api.GetCursorInfo.restype = ctypes.c_int
+        self.bounds = tuple(self.api.GetSystemMetrics(index) for index in (76, 77, 78, 79))
+        if self.bounds[2] <= 0 or self.bounds[3] <= 0:
+            raise RuntimeError("无法读取 Windows 虚拟桌面坐标。")
+
+    @staticmethod
+    def _absolute(value: int, origin: int, extent: int) -> int:
+        # Aim at the pixel centre in Win32's 16-bit absolute coordinate space.
+        # This reaches every pixel in normal desktop sizes, including negative
+        # monitor origins, without applying pointer acceleration a second time.
+        pixel = max(0, min(extent - 1, int(value) - origin))
+        return min(65535, (pixel * 65536 + 32768) // extent)
+
+    def move_to(self, x: int, y: int, tag: int) -> None:
+        left, top, width, height = self.bounds
+        event = self.Input()
+        event.type = 0  # INPUT_MOUSE
+        event.mi = self.MouseInput(
+            self._absolute(x, left, width), self._absolute(y, top, height),
+            0, 0x0001 | 0x4000 | 0x8000, 0, tag)  # MOVE | VIRTUALDESK | ABSOLUTE
+        if self.api.SendInput(1, ctypes.byref(event), ctypes.sizeof(event)) != 1:
+            raise RuntimeError("系统拒绝鼠标输入，请检查目标窗口的权限或停止共享后重试。")
+
+    def cursor_visible(self) -> bool | None:
+        info = self.CursorInfo(cbSize=ctypes.sizeof(self.CursorInfo))
+        if not self.api.GetCursorInfo(ctypes.byref(info)):
+            return None
+        return bool(info.flags & 0x0001) and not bool(info.flags & 0x0002)
+
+
 def validate_key_code(code: object) -> bool:
     """Only symbolic names and a single printable Unicode scalar cross the wire."""
     if not isinstance(code, str):
@@ -123,6 +194,7 @@ class NativeInput:
         self._started = False
         self._stopping = threading.Event()
         self._monitor = None
+        self._windows_mouse = None
 
     def start(self) -> None:
         if self._started:
@@ -134,6 +206,7 @@ class NativeInput:
         self._kb_module, self._mouse_module = keyboard, mouse
         self._keyboard, self._mouse = keyboard.Controller(), mouse.Controller()
         if sys.platform == "win32":
+            self._windows_mouse = _WindowsMouse()
             self._keyboard_listener = keyboard.Listener(
                 win32_event_filter=self._win_keyboard)
             self._mouse_listener = mouse.Listener(win32_event_filter=self._win_mouse)
@@ -218,6 +291,7 @@ class NativeInput:
         self._listeners.clear()
         self._physical_keys.clear()
         self._physical_buttons.clear()
+        self._windows_mouse = None
         self._started = False
 
     def _emit(self, event: dict) -> None:
@@ -236,7 +310,7 @@ class NativeInput:
             if not enabled:
                 self.capturing = False
                 if self._restore and self._mouse:
-                    self.move_to(*self._restore)
+                    self._warp_to(*self._restore)
                 self._restore = None
                 return
             if self.capturing:
@@ -247,7 +321,7 @@ class NativeInput:
                 raise RuntimeError("请先松开键盘按键和鼠标按钮，再切换到另一台电脑。")
             self._restore = self.position()
             self._anchor = self._capture_center()
-            self.move_to(*self._anchor)
+            self._warp_to(*self._anchor)
             self.capturing = True
 
     def _capture_center(self) -> tuple[int, int]:
@@ -289,14 +363,44 @@ class NativeInput:
                     "middle": q.kCGEventOtherMouseDragged}.get(button, q.kCGEventMouseMoved)
             number = {"left": 0, "right": 1, "middle": 2}.get(button, 0)
             self._mac_post(q.CGEventCreateMouseEvent(None, kind, (int(x), int(y)), number))
+        elif sys.platform == "win32":
+            if self._windows_mouse is None:
+                self._windows_mouse = _WindowsMouse()
+            self._windows_mouse.move_to(x, y, self._tag)
         else:
             self._mouse.position = (int(x), int(y))
+
+    def _warp_to(self, x: int, y: int) -> None:
+        """Position the capture anchor without asynchronous remote input."""
+        if self._mouse is None:
+            return
+        if sys.platform == "darwin":
+            # Posting an event here can be observed after capture is enabled,
+            # accidentally forwarding the anchor jump as a large remote move.
+            result = self._quartz.CGWarpMouseCursorPosition((int(x), int(y)))
+            if result != self._quartz.kCGErrorSuccess:
+                raise RuntimeError("无法定位捕获光标，请检查辅助功能权限。")
+        else:
+            self._mouse.position = (int(x), int(y))
+
+    def cursor_visible(self) -> bool | None:
+        """Read visibility without changing OS cursor counters or preferences."""
+        if self._mouse is None:
+            return None
+        if sys.platform == "win32":
+            if self._windows_mouse is None:
+                self._windows_mouse = _WindowsMouse()
+            return self._windows_mouse.cursor_visible()
+        if sys.platform == "darwin":
+            check = getattr(self._quartz, "CGCursorIsVisible", None)
+            return bool(check()) if check else None
+        return None
 
     def move_by(self, dx: int, dy: int) -> None:
         x, y = self.position()
         self.move_to(x + int(dx), y + int(dy))
 
-    def button(self, name: str, pressed: bool) -> None:
+    def button(self, name: str, pressed: bool, position=None) -> None:
         if name not in BUTTONS or type(pressed) is not bool:
             raise ValueError("不支持的鼠标按钮。")
         if self._mouse is None:
@@ -307,7 +411,9 @@ class NativeInput:
                      "right": (q.kCGEventRightMouseDown, q.kCGEventRightMouseUp, 1),
                      "middle": (q.kCGEventOtherMouseDown, q.kCGEventOtherMouseUp, 2)}
             down, up, number = kinds[name]
-            position = self.position()
+            # Quartz posts movement asynchronously. The session can supply its
+            # current target so a following click cannot land at the old OS point.
+            position = self.position() if position is None else (int(position[0]), int(position[1]))
             now = time.monotonic()
             last, old_pos, count = self._clicks.get(name, (0, position, 0))
             if pressed:
@@ -372,7 +478,7 @@ class NativeInput:
             self.key(code, True)
             self.key(code, False)
 
-    def release_all(self) -> None:
+    def release_all(self, position=None) -> None:
         for code in list(self._injected_keys):
             try:
                 self.key(code, False)
@@ -380,7 +486,7 @@ class NativeInput:
                 pass
         for name in list(self._injected_buttons):
             try:
-                self.button(name, False)
+                self.button(name, False, position)
             except Exception:
                 pass
         self._injected_keys.clear()

@@ -55,6 +55,9 @@ class Engine:
         self._native_started = False
         self._mapped_keys = {}
         self._scroll_remainder = [0., 0.]
+        self._pointer_position = None
+        self._pending_position = None
+        self._posted_position = None
 
     def enqueue(self, kind: str, value=None, generation=None):
         try:
@@ -79,6 +82,7 @@ class Engine:
             raise
 
     def stop(self, announce=True):
+        last_position = self._posted_position
         self._generation += 1
         self.connected = False
         self.remote_active = False
@@ -86,9 +90,10 @@ class Engine:
         self.remote_bounds = None
         self._mapped_keys.clear()
         self._scroll_remainder = [0., 0.]
+        self._pointer_position = self._pending_position = self._posted_position = None
         try:
             self.native.set_capturing(False)
-            self.native.release_all()
+            self.native.release_all(last_position)
         finally:
             if self._native_started:
                 self.native.stop()
@@ -133,6 +138,17 @@ class Engine:
             except Exception as exc:
                 self.stop()
                 self.changed("error", str(exc)[:240])
+        try:
+            self._flush_motion()
+        except Exception as exc:
+            self.stop()
+            self.changed("error", str(exc)[:240])
+
+    def _flush_motion(self):
+        position, self._pending_position = self._pending_position, None
+        if position is not None and position != self._posted_position:
+            self.native.move_to(*position)
+            self._posted_position = position
 
     def _send(self, message):
         if not self.transport or not self.transport.send(message):
@@ -161,6 +177,9 @@ class Engine:
 
     def _message(self, msg):
         kind = msg.get("type")
+        if kind != "move":
+            # Keep clicks, keys and session boundaries after all preceding motion.
+            self._flush_motion()
         if kind == "hello":
             if self.remote_bounds is not None or type(msg.get("version")) is not int or msg.get("version") != 1:
                 raise ValueError("对端协议版本不匹配")
@@ -198,15 +217,18 @@ class Engine:
             rx, ry = number(msg.get("rx"), 1), number(msg.get("ry"), 1)
             if rx < 0 or ry < 0:
                 raise ValueError("无效的进入坐标")
-            self.native.release_all()
+            self.native.release_all(self._posted_position)
             self.side = side
             self.receiving = True
-            self.native.move_to(*self.layout.entry(side, rx, ry))
+            self._pointer_position = self.layout.entry(side, rx, ry)
+            self._pending_position = self._pointer_position
+            self._flush_motion()
             self.changed("receiving", "对端正在控制此电脑 · Ctrl+Alt+Esc 停止")
             return
         if kind == "leave":
             self.receiving = False
-            self.native.release_all()
+            self.native.release_all(self._posted_position)
+            self._pointer_position = self._posted_position = None
             self._mapped_keys.clear()
             self.changed("ready", f"已连接 {self.peer_name} · 等待对端控制")
             return
@@ -222,18 +244,24 @@ class Engine:
             self.native.type_text(text)
         elif kind == "move":
             dx, dy = number(msg.get("dx")), number(msg.get("dy"))
-            x, y = self.native.position()
+            # Native injection is asynchronous on macOS and can be queued on
+            # Windows. Reading the OS here loses deltas that have not landed yet.
+            x, y = self._pointer_position
+            desired = (x + dx, y + dy)
             # Project gaps in an irregular monitor layout onto a real screen.
             # Internal monitor borders remain traversable in the same session.
-            x, y = self.layout.clamp(x + dx, y + dy)
-            self.native.move_to(x, y)
+            x, y = self.layout.clamp(*desired)
+            self._pointer_position = desired if self.layout.contains(*desired) else (x, y)
+            self._pending_position = (x, y)
             crossed = ((self.side == "right" and dx < 0 and x <= self.bounds.x) or
                        (self.side == "left" and dx > 0 and x >= self.bounds.x + self.bounds.width - 1) or
                        (self.side == "bottom" and dy < 0 and y <= self.bounds.y) or
                        (self.side == "top" and dy > 0 and y >= self.bounds.y + self.bounds.height - 1))
             if crossed:
+                self._flush_motion()
                 self.receiving = False
-                self.native.release_all()
+                self.native.release_all(self._posted_position)
+                self._pointer_position = self._posted_position = None
                 self._mapped_keys.clear()
                 rx, ry = self.bounds.ratio(x, y)
                 self._send({"type": "return", "rx": rx, "ry": ry})
@@ -241,7 +269,7 @@ class Engine:
         elif kind == "button":
             if msg.get("button") not in {"left", "right", "middle"} or type(msg.get("pressed")) is not bool:
                 raise ValueError("无效的鼠标按键")
-            self.native.button(msg["button"], msg["pressed"])
+            self.native.button(msg["button"], msg["pressed"], self._posted_position)
         elif kind == "scroll":
             dx, dy = number(msg.get("dx"), 120), number(msg.get("dy"), 120)
             self._scroll_remainder[0] += dx
@@ -258,6 +286,12 @@ class Engine:
             self.native.key(key, pressed)
 
     def _input(self, event):
+        if self.role == "receiver" and self.receiving and event.get("type") == "local_move":
+            # A real local mouse move supersedes earlier queued remote motion.
+            self._pointer_position = self.layout.clamp(event["x"], event["y"])
+            self._pending_position = None
+            self._posted_position = self._pointer_position
+            return
         if self.role != "controller" or not self.remote_bounds:
             return
         if event.get("type") == "local_move":

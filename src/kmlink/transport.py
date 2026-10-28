@@ -37,6 +37,8 @@ MAX_MESSAGE_BYTES = 256 * 1024
 HEARTBEAT_INTERVAL = 1.0
 PEER_TIMEOUT = 6.0
 HANDSHAKE_TIMEOUT = 3.0
+MAX_SEND_BATCH_FRAMES = 64
+MAX_SEND_BATCH_BYTES = 64 * 1024
 _INTERNAL = "_kmlink_transport"
 
 
@@ -276,6 +278,9 @@ class _Run:
     lock: threading.RLock = field(default_factory=threading.RLock)
     listener: socket.socket | None = None
     sock: socket.socket | None = None
+    wake_read: socket.socket | None = None
+    wake_write: socket.socket | None = None
+    pending_frame: bytes | None = None
     thread: threading.Thread | None = None
     failure: str = ""
 
@@ -320,12 +325,23 @@ class Transport:
         key = base64.urlsafe_b64decode(normalized + "=" * (-len(normalized) % 4))
         self.stop()
         run = _Run()
+        # A socketpair wakes the one TLS worker on every new outgoing burst.
+        # It avoids polling at 100 Hz (and delaying a just-arrived mouse event
+        # by another 10 ms), while still letting the same worker own all SSL IO.
+        run.wake_read, run.wake_write = socket.socketpair()
+        run.wake_read.setblocking(False)
+        run.wake_write.setblocking(False)
         self._run = run
         run.thread = threading.Thread(
             target=target, args=(run, host.strip(), port, key),
             name="kmlink-transport", daemon=True,
         )
-        run.thread.start()
+        try:
+            run.thread.start()
+        except Exception:
+            self._run = None
+            self._close_wakeup(run)
+            raise
 
     def listen(self, host: str, port: int, pairing_key: str) -> None:
         self._start(self._listen, host, port, pairing_key)
@@ -347,11 +363,72 @@ class Transport:
             return False
         try:
             run.outgoing.put_nowait(encoded)
+            self._wake(run)
             return True
         except queue.Full:
             run.failure = "发送队列已满，连接已安全断开。"
             self._close_socket(run.sock)
+            self._wake(run)
             return False
+
+    @staticmethod
+    def _wake(run: _Run) -> None:
+        writer = run.wake_write
+        if writer is not None:
+            try:
+                writer.send(b"\0")
+            except (BlockingIOError, OSError):
+                # A full pipe is already readable; a closed pipe belongs to a
+                # session that is stopping. Neither may block an input hook.
+                pass
+
+    @staticmethod
+    def _close_wakeup(run: _Run) -> None:
+        with run.lock:
+            sockets = run.wake_read, run.wake_write
+            run.wake_read = run.wake_write = None
+        for sock in sockets:
+            if sock is not None:
+                sock.close()
+
+    @staticmethod
+    def _outgoing_batch(run: _Run) -> bytes:
+        """Batch ready frames without changing protocol framing or event order."""
+        frames = []
+        total = 0
+        for _ in range(MAX_SEND_BATCH_FRAMES):
+            frame = run.pending_frame
+            run.pending_frame = None
+            if frame is None:
+                try:
+                    frame = run.outgoing.get_nowait()
+                except queue.Empty:
+                    break
+            if frames and total + len(frame) > MAX_SEND_BATCH_BYTES:
+                run.pending_frame = frame
+                break
+            frames.append(frame)
+            total += len(frame)
+            # A legal single large frame must still be allowed through, but
+            # cannot drag more frames into an unbounded write behind it.
+            if total >= MAX_SEND_BATCH_BYTES:
+                break
+        return b"".join(frames)
+
+    @staticmethod
+    def _wait_for_input(run: _Run, sock: ssl.SSLSocket, timeout: float) -> bool:
+        if sock.pending() > 0:
+            return True
+        reader = run.wake_read
+        readable = select.select([sock, reader] if reader is not None else [sock], [], [], timeout)[0]
+        if reader is not None and reader in readable:
+            for _ in range(16):
+                try:
+                    if not reader.recv(4096):
+                        break
+                except BlockingIOError:
+                    break
+        return sock in readable
 
     @staticmethod
     def _close_socket(sock: socket.socket | None) -> None:
@@ -372,10 +449,12 @@ class Transport:
         self._run = None
         run.stop.set()
         run.connected.clear()
+        self._wake(run)
         self._close_socket(run.listener)
         self._close_socket(run.sock)
         if run.thread and run.thread is not threading.current_thread():
             run.thread.join(timeout=0.8)
+        self._close_wakeup(run)
 
     def _install_socket(self, run: _Run, sock: socket.socket) -> None:
         with run.lock:
@@ -383,6 +462,9 @@ class Transport:
                 sock.close()
                 raise ConnectionAbortedError("Stopped")
             run.sock = sock
+            # Mouse/key frames are tiny. Avoid Nagle waiting for delayed ACKs
+            # between successive TLS records on either side of the connection.
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     def _listen(self, run: _Run, host: str, port: int, key: bytes) -> None:
         try:
@@ -421,6 +503,7 @@ class Transport:
             run.connected.clear()
             self._close_socket(run.sock)
             self._close_socket(run.listener)
+            self._close_wakeup(run)
 
     def _connect(self, run: _Run, host: str, port: int, key: bytes) -> None:
         self._status(run, "connecting", f"正在连接 {host}:{port}…")
@@ -444,6 +527,7 @@ class Transport:
         finally:
             run.connected.clear()
             self._close_socket(run.sock)
+            self._close_wakeup(run)
 
     @staticmethod
     def _error_text(exc: Exception) -> str:
@@ -465,20 +549,23 @@ class Transport:
             while not run.stop.is_set():
                 if run.failure:
                     raise ConnectionError(run.failure)
-                # Bound each drain so continuously arriving mouse events do
-                # not starve reads, heartbeats, or the emergency disconnect.
-                for _ in range(64):
-                    try:
-                        sock.sendall(run.outgoing.get_nowait())
-                    except queue.Empty:
-                        break
+                # One ready batch becomes one TLS write, not one TLS record
+                # and syscall for each high-frequency mouse event. The bounded
+                # batch keeps reads, heartbeats and emergency input responsive.
+                batch = self._outgoing_batch(run)
+                if batch:
+                    sock.sendall(batch)
                 now = time.monotonic()
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                     sock.sendall(_encode({_INTERNAL: "heartbeat"}))
                     last_heartbeat = now
                 if now - last_received >= PEER_TIMEOUT:
                     raise TimeoutError("对端无响应，已收回控制。")
-                ready = sock.pending() > 0 or bool(select.select([sock], [], [], 0.01)[0])
+                timeout = max(0., min(HEARTBEAT_INTERVAL - (now - last_heartbeat),
+                                     PEER_TIMEOUT - (now - last_received)))
+                if run.pending_frame is not None or not run.outgoing.empty():
+                    timeout = 0.
+                ready = self._wait_for_input(run, sock, timeout)
                 if not ready:
                     continue
                 message = _read_frame(sock, run.stop)

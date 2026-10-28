@@ -47,10 +47,13 @@ class FakeEngine:
         self.share_clipboard = False
         self.map_ctrl_cmd = False
         self.remote_bounds = None
+        self.receiving = False
         self.transport = SimpleNamespace(listening_address=("127.0.0.1", 24880))
 
     def start(self, *args): self.calls.append(("start", *args))
-    def stop(self, **kwargs): self.calls.append(("stop", kwargs))
+    def stop(self, **kwargs):
+        self.receiving = False
+        self.calls.append(("stop", kwargs))
     def poll(self): pass
 
 
@@ -66,11 +69,11 @@ class NativeRecorder:
     def start(self): self.starts += 1
     def stop(self): self.stops += 1
     def set_capturing(self, value): self.capturing = value
-    def release_all(self): self.releases += 1
+    def release_all(self, position=None): self.releases += 1
     def position(self): return self.xy
     def move_to(self, x, y): self.xy = (x, y)
     def key(self, key, pressed): pass
-    def button(self, name, pressed): pass
+    def button(self, name, pressed, position=None): pass
     def scroll(self, dx, dy): pass
 
 
@@ -102,6 +105,19 @@ class DiscoveryUITests(unittest.TestCase):
 
     def peer(self, peer_id="remote-one", busy=False):
         return Peer(peer_id, "Office Mac", "Darwin", "192.168.1.22", 41001, busy, time.monotonic())
+
+    def test_receiver_cursor_fallback_is_polled_and_hidden_on_stop(self):
+        self.assertEqual(self.window.timer.timerType(), Qt.TimerType.PreciseTimer)
+        self.window.cursor_indicator._visibility_query = lambda: False
+        self.engine.receiving = True
+        self.window._poll()
+        pointer = self.window.cursor_indicator._widget
+        self.assertIsNotNone(pointer)
+        self.assertTrue(pointer.isVisible())
+        self.window._stop()
+        self.assertFalse(pointer.isVisible())
+        self.window.close()
+        self.assertTrue(self.window.cursor_indicator._closed)
 
     def invitation(self, local_role="receiver"):
         return {"request_id": "request-one", "peer_id": "remote-one", "peer_name": "Office Mac",

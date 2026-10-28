@@ -22,9 +22,9 @@ class InputRecorder:
     def set_capturing(self, capture): self.capturing = capture
     def move_to(self, x, y): self.xy = (x, y)
     def key(self, key, pressed): self.keys.append((key, pressed))
-    def button(self, name, pressed): self.buttons.append((name, pressed))
+    def button(self, name, pressed, position=None): self.buttons.append((name, pressed))
     def scroll(self, dx, dy): self.scrolls.append((dx, dy))
-    def release_all(self): self.releases += 1
+    def release_all(self, position=None): self.releases += 1
 
 
 class FullSessionTests(unittest.TestCase):

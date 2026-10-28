@@ -1,6 +1,7 @@
 """Actual localhost TLS tests; no keyboard hooks or GUI required."""
 
 import hashlib
+import io
 import socket
 import ssl
 import struct
@@ -72,6 +73,33 @@ class TransportTests(unittest.TestCase):
         self.assertFalse(client.send({"type": "key"}))
         server.stop()
         self.assertIsNone(server.listening_address)
+
+    def test_high_rate_input_keeps_frame_order_without_dropping_release(self):
+        key = generate_pairing_key()
+        server, received, _ = self.server(key)
+        client, _, _ = self.transport()
+        client.connect("127.0.0.1", server.listening_address[1], key)
+        wait_until(lambda: server.is_connected and client.is_connected)
+        for transport in (client, server):
+            self.assertEqual(transport._run.sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
+        messages = ([{"type": "button", "button": "left", "pressed": True}]
+                    + [{"type": "move", "dx": n % 7 - 3, "dy": n % 5 - 2} for n in range(700)]
+                    + [{"type": "button", "button": "left", "pressed": False},
+                       {"type": "key", "key": "named:ctrl_l", "pressed": False}])
+        self.assertTrue(all(client.send(message) for message in messages))
+        wait_until(lambda: len(received) == len(messages))
+        self.assertEqual(received, messages)
+        self.assertTrue(server.is_connected and client.is_connected)
+
+    def test_stop_releases_worker_wakeup_sockets(self):
+        server, _, _ = self.server(generate_pairing_key())
+        run = server._run
+        reader, writer = run.wake_read, run.wake_write
+        server.stop()
+        self.assertIsNone(run.wake_read)
+        self.assertIsNone(run.wake_write)
+        self.assertEqual(reader.fileno(), -1)
+        self.assertEqual(writer.fileno(), -1)
 
     def test_wrong_key_never_delivers_then_correct_peer_can_join(self):
         key = generate_pairing_key()
@@ -217,6 +245,79 @@ class TransportTests(unittest.TestCase):
             if peer:
                 peer.close()
             listener.close()
+
+
+class OutgoingBatchTests(unittest.TestCase):
+    @staticmethod
+    def decode(data):
+        stream = io.BytesIO(data)
+        class Input:
+            recv = stream.read
+        result = []
+        while stream.tell() < len(data):
+            result.append(_read_frame(Input(), threading.Event()))
+        return result
+
+    def test_batch_preserves_each_frame_and_obeys_frame_budget(self):
+        run = transport_module._Run()
+        messages = [{"type": "move", "dx": index, "dy": 0} for index in range(150)]
+        for message in messages:
+            run.outgoing.put(_encode(message))
+        batches = []
+        while not run.outgoing.empty():
+            batches.append(Transport._outgoing_batch(run))
+        decoded = [self.decode(batch) for batch in batches]
+        self.assertEqual([len(batch) for batch in decoded], [64, 64, 22])
+        self.assertEqual([message for batch in decoded for message in batch], messages)
+
+    def test_large_frame_is_not_split_or_reordered_at_byte_budget(self):
+        run = transport_module._Run()
+        messages = [{"type": "clipboard", "text": "a" * 40000},
+                    {"type": "clipboard", "text": "b" * 40000},
+                    {"type": "button", "button": "left", "pressed": False}]
+        for message in messages:
+            run.outgoing.put(_encode(message))
+        first = self.decode(Transport._outgoing_batch(run))
+        self.assertEqual(first, messages[:1])
+        self.assertIsNotNone(run.pending_frame)
+        self.assertEqual(self.decode(Transport._outgoing_batch(run)), messages[1:])
+        self.assertIsNone(run.pending_frame)
+        large = {"type": "clipboard", "text": "c" * 100000}
+        run.outgoing.put(_encode(large))
+        self.assertEqual(self.decode(Transport._outgoing_batch(run)), [large])
+
+    def test_queued_input_wakes_idle_selector_without_polling_delay(self):
+        run = transport_module._Run()
+        run.wake_read, run.wake_write = socket.socketpair()
+        run.wake_read.setblocking(False)
+        run.wake_write.setblocking(False)
+        network, peer = socket.socketpair()
+        entered = threading.Event()
+        result = []
+        class QuietTLS:
+            def fileno(self):
+                return network.fileno()
+            def pending(self):
+                return 0
+        def wait():
+            entered.set()
+            result.append(Transport._wait_for_input(run, QuietTLS(), 2.0))
+        worker = threading.Thread(target=wait, daemon=True)
+        try:
+            worker.start()
+            self.assertTrue(entered.wait(.5))
+            Transport._wake(run)
+            worker.join(.75)
+            self.assertFalse(worker.is_alive(), "New input must wake an idle TLS worker")
+            self.assertEqual(result, [False])
+            # All wake bytes are drained; the next turn can wait normally.
+            with self.assertRaises(BlockingIOError):
+                run.wake_read.recv(1)
+        finally:
+            Transport._close_wakeup(run)
+            network.close()
+            peer.close()
+            worker.join(.5)
 
 
 class TLSHandshakeTests(unittest.TestCase):

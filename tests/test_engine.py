@@ -32,7 +32,7 @@ class FakeNative:
         self.calls.append(("capture", enabled))
         self.capturing = enabled
 
-    def release_all(self):
+    def release_all(self, position=None):
         self.calls.append(("release_all",))
         self.keys.clear()
         self.buttons.clear()
@@ -44,7 +44,7 @@ class FakeNative:
         self.calls.append(("move", x, y))
         self.xy = (x, y)
 
-    def button(self, name, pressed):
+    def button(self, name, pressed, position=None):
         self.calls.append(("button", name, pressed))
         (self.buttons.add if pressed else self.buttons.discard)(name)
 
@@ -165,11 +165,13 @@ class EngineTests(unittest.TestCase):
         engine, native, transport, _, _, _ = self.build("receiver", layout=layout)
         self.message(engine, transport, {"type": "enter", "side": "right", "rx": .5, "ry": .5})
         native.xy = (-2, 500)
+        engine.enqueue("input", {"type": "local_move", "x": -2, "y": 500})
         self.message(engine, transport, {"type": "move", "dx": 10, "dy": 0})
         self.assertEqual(native.xy, (8, 500))
         self.assertTrue(engine.receiving)
         self.assertFalse(any(m["type"] == "return" for m in transport.sent))
         native.xy = (-1279, 500)
+        engine.enqueue("input", {"type": "local_move", "x": -1279, "y": 500})
         self.message(engine, transport, {"type": "move", "dx": -10, "dy": 0})
         self.assertFalse(engine.receiving)
         self.assertEqual(transport.sent[-1]["type"], "return")
@@ -449,6 +451,84 @@ class EngineTests(unittest.TestCase):
             self.assertFalse(engine.receiving)
             self.assertFalse(native.capturing)
             self.assertEqual(engine.connected, role == "controller")
+
+    def test_async_native_moves_keep_every_delta_and_flush_once_per_poll(self):
+        engine, native, transport, _, _, _ = self.build("receiver")
+        self.message(engine, transport, {"type": "enter", "side": "right", "rx": .5, "ry": .5})
+        origin = native.xy
+        posted = []
+        native.move_to = lambda x, y: posted.append((x, y))
+        # A queued OS input API can still report the old position here.
+        native.position = lambda: origin
+        for _ in range(100):
+            transport.on_message({"type": "move", "dx": 1, "dy": 0})
+        engine.poll()
+        self.assertEqual(posted, [(origin[0] + 100, origin[1])])
+        transport.on_message({"type": "move", "dx": 2, "dy": 1})
+        engine.poll()
+        self.assertEqual(posted[-1], (origin[0] + 102, origin[1] + 1))
+
+    def test_motion_flushes_before_click_key_and_leave(self):
+        engine, native, transport, _, _, _ = self.build("receiver")
+        self.message(engine, transport, {"type": "enter", "side": "right", "rx": .5, "ry": .5})
+        x, y = native.xy
+        ordered = []
+        native.move_to = lambda a, b: ordered.append(("move", a, b))
+        native.button = lambda name, down, position=None: ordered.append(("button", name, down, position))
+        native.key = lambda name, down: ordered.append(("key", name, down))
+        for message in ({"type": "move", "dx": 3, "dy": 0},
+                        {"type": "move", "dx": 4, "dy": 0},
+                        {"type": "button", "button": "left", "pressed": True},
+                        {"type": "move", "dx": 5, "dy": 0},
+                        {"type": "key", "key": "char:a", "pressed": True},
+                        {"type": "move", "dx": 6, "dy": 0}, {"type": "leave"}):
+            transport.on_message(message)
+        engine.poll()
+        self.assertEqual(ordered, [("move", x + 7, y),
+                                  ("button", "left", True, (x + 7, y)),
+                                  ("move", x + 12, y), ("key", "char:a", True),
+                                  ("move", x + 18, y)])
+        self.assertFalse(engine.receiving)
+
+    def test_fractional_motion_accumulates_without_rounding_each_event(self):
+        engine, native, transport, _, _, _ = self.build("receiver")
+        self.message(engine, transport, {"type": "enter", "side": "right", "rx": .5, "ry": .5})
+        x, y = native.xy
+        for _ in range(4):
+            self.message(engine, transport, {"type": "move", "dx": .25, "dy": 0})
+        self.assertEqual(native.xy, (x + 1, y))
+
+    def test_batched_motion_keeps_return_boundary_before_direction_reversal(self):
+        engine, native, transport, _, _, _ = self.build("receiver")
+        self.message(engine, transport, {"type": "enter", "side": "right", "rx": .5, "ry": .5})
+        native.calls.clear()
+        transport.on_message({"type": "move", "dx": -100, "dy": 0})
+        transport.on_message({"type": "move", "dx": 100, "dy": 0})
+        engine.poll()
+        self.assertEqual(native.xy[0], 0)
+        self.assertFalse(engine.receiving)
+        self.assertEqual(sum(m["type"] == "return" for m in transport.sent), 1)
+
+    def test_local_mouse_rebases_receiver_position(self):
+        engine, native, transport, _, _, _ = self.build("receiver")
+        self.message(engine, transport, {"type": "enter", "side": "right", "rx": .5, "ry": .5})
+        transport.on_message({"type": "move", "dx": 100, "dy": 0})
+        engine.enqueue("input", {"type": "local_move", "x": 700, "y": 200})
+        transport.on_message({"type": "move", "dx": 5, "dy": 2})
+        engine.poll()
+        self.assertEqual(native.xy, (705, 202))
+
+    def test_failed_motion_flush_disconnects_and_releases_input(self):
+        engine, native, transport, statuses, _, _ = self.build("receiver")
+        self.message(engine, transport, {"type": "enter", "side": "right", "rx": .5, "ry": .5})
+        def rejected(x, y):
+            raise RuntimeError("Input rejected")
+        native.move_to = rejected
+        transport.on_message({"type": "move", "dx": 5, "dy": 0})
+        engine.poll()
+        self.assertFalse(engine.connected)
+        self.assertFalse(engine.receiving)
+        self.assertEqual(statuses[-1], ("error", "Input rejected"))
 
 
 if __name__ == "__main__":
