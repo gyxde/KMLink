@@ -145,6 +145,9 @@ class MainWindow(QMainWindow):
         self.engine = Engine(self.native, self._desktop_layout.bounds, self._changed,
                              QApplication.clipboard().setText, validate_key_code, layout=self._desktop_layout)
         self._tracked_screens = set()
+        self._display_timer = QTimer(self)
+        self._display_timer.setSingleShot(True)
+        self._display_timer.timeout.connect(self._refresh_display_layout)
         self._watch_screens()
         self._update_layout_info()
         QApplication.instance().screenAdded.connect(self._screens_changed)
@@ -373,15 +376,39 @@ class MainWindow(QMainWindow):
         outer.addLayout(footer)
 
     def _watch_screens(self):
-        for screen in QApplication.screens():
+        current = set(QApplication.screens())
+        for screen in self._tracked_screens - current:
+            self._disconnect_screen(screen)
+        self._tracked_screens.intersection_update(current)
+        for screen in current:
             if screen not in self._tracked_screens:
                 self._tracked_screens.add(screen)
                 screen.geometryChanged.connect(self._screens_changed)
                 screen.physicalDotsPerInchChanged.connect(self._screens_changed)
 
+    def _disconnect_screen(self, screen):
+        try:
+            screen.geometryChanged.disconnect(self._screens_changed)
+            screen.physicalDotsPerInchChanged.disconnect(self._screens_changed)
+        except (RuntimeError, TypeError):
+            pass  # A removed display may already have destroyed its QScreen.
+
+    def _unwatch_screens(self):
+        self._display_timer.stop()
+        app = QApplication.instance()
+        if app is not None:
+            for signal in (app.screenAdded, app.screenRemoved):
+                try:
+                    signal.disconnect(self._screens_changed)
+                except (RuntimeError, TypeError):
+                    pass
+        for screen in self._tracked_screens:
+            self._disconnect_screen(screen)
+        self._tracked_screens.clear()
+
     def _screens_changed(self, *args):
         if not self._closing:
-            QTimer.singleShot(0, self._refresh_display_layout)
+            self._display_timer.start(0)
 
     def _update_layout_info(self):
         bounds = self._desktop_layout.bounds
@@ -827,7 +854,11 @@ class MainWindow(QMainWindow):
             "两端都需运行 KMLink。关闭窗口会停止共享。")
 
     def closeEvent(self, event):
+        if self._closing:
+            event.accept()
+            return
         self._closing = True
+        self._unwatch_screens()
         self.timer.stop()
         self.clipboard_timer.stop()
         self._stop_services()

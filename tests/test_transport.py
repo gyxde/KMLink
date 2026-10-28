@@ -137,7 +137,9 @@ class TransportTests(unittest.TestCase):
                 wait_until(lambda: server.is_connected)
                 # This authenticated peer deliberately sends no heartbeat.
                 wait_until(lambda: not server.is_connected)
-                self.assertTrue(any(state == "disconnected" for state, _ in statuses))
+                # The socket is closed between clearing the connection flag and
+                # publishing the status callback; wait for both observable events.
+                wait_until(lambda: any(state == "disconnected" for state, _ in statuses))
         finally:
             peer.close()
 

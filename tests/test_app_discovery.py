@@ -8,7 +8,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import QCoreApplication, QEvent, Qt
     from PySide6.QtWidgets import QApplication, QPushButton
     from kmlink.app import MainWindow
     from kmlink.discovery import Peer
@@ -95,6 +95,8 @@ class DiscoveryUITests(unittest.TestCase):
 
     def tearDown(self):
         self.window.close()
+        self.window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
         self.permissions.stop()
 
@@ -278,6 +280,17 @@ class DiscoveryUITests(unittest.TestCase):
         self.assertIn(("stop",), self.discovery.calls)
         self.assertTrue(any(call[0] == "stop" for call in self.engine.calls))
 
+    def test_close_detaches_screens_and_cancels_queued_layout_refresh(self):
+        self.window._screens_changed()
+        self.assertTrue(self.window._display_timer.isActive())
+        self.window.close()
+        self.assertFalse(self.window._display_timer.isActive())
+        self.assertEqual(self.window._tracked_screens, set())
+        with patch("kmlink.app.query_desktop_layout") as query:
+            self.window._screens_changed()
+            self.app.processEvents()
+        query.assert_not_called()
+
     def _real_tls_handoff(self, mode):
         """Exercise UI consent, invitation TLS, and control TLS together."""
         from kmlink.engine import Engine
@@ -347,6 +360,8 @@ class DiscoveryUITests(unittest.TestCase):
             self.assertGreater(second.native.releases, 0)
         finally:
             second.close()
+            second.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             first._stop()
 
     def test_real_tls_ui_handoff_for_control_request(self):

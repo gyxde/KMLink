@@ -4,18 +4,31 @@ PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="${ANDROID_HOME:?ANDROID_HOME must point to the Android SDK}"
 REPORTS="$PROJECT_ROOT/android/app/build/reports"
 mkdir -p "$REPORTS"
-MODERN="$SDK/cmdline-tools/latest/bin/android"
-if [[ -x "$MODERN" ]]; then
-  "$MODERN" --no-metrics --sdk="$SDK" sdk install emulator system-images/android-35/google_apis/x86_64
+TOOLS="$SDK/cmdline-tools/latest/bin"
+if [[ ! -x "$TOOLS/android" && ! -x "$TOOLS/sdkmanager" ]]; then
+  TOOLS=""
+  for candidate in "$SDK"/cmdline-tools/*/bin; do
+    if [[ -x "$candidate/android" || -x "$candidate/sdkmanager" ]]; then
+      TOOLS="$candidate"
+      break
+    fi
+  done
+fi
+if [[ -z "$TOOLS" ]]; then
+  echo "Android command-line tools were not found under $SDK." >&2
+  exit 1
+fi
+if [[ -x "$TOOLS/android" ]]; then
+  "$TOOLS/android" --no-metrics --sdk="$SDK" sdk install emulator system-images/android-35/google_apis/x86_64
 else
-  sdkmanager "emulator" "system-images;android-35;google_apis;x86_64"
+  "$TOOLS/sdkmanager" --sdk_root="$SDK" "emulator" "system-images;android-35;google_apis;x86_64"
 fi
 if [[ ! -e /dev/kvm ]]; then
   echo "The Android emulator smoke test requires the runner's KVM device." >&2
   exit 1
 fi
 sudo chmod 666 /dev/kvm
-AVDMANAGER="$SDK/cmdline-tools/latest/bin/avdmanager"
+AVDMANAGER="$TOOLS/avdmanager"
 printf 'no\n' | "$AVDMANAGER" create avd --force --name kmlink-smoke --package "system-images;android-35;google_apis;x86_64" --device pixel_5
 export ANDROID_SERIAL=emulator-5554
 "$SDK/platform-tools/adb" start-server

@@ -2,6 +2,12 @@
 
 选择对应平台的文件。桌面版解压后运行，Android 版直接安装 APK。两端都需要安装本版本的 KMLink。
 
+本次更新：
+
+- 新增 Android 设备连接：局域网发现、双向控制申请、应用内触控板，以及通过辅助功能服务接受电脑控制。
+- 修复多显示器内部边界误触发跨设备切换的问题；跨设备切换仅在整组显示器的外侧边缘发生。
+- 显示器插拔或布局变化时自动安全断开当前控制连接，避免沿用失效的屏幕坐标。
+
 | 平台 | 下载 |
 | --- | --- |
 | Windows 64 位 | [KMLink-windows-x64.zip](https://github.com/@REPOSITORY@/releases/download/@TAG@/KMLink-windows-x64.zip) |

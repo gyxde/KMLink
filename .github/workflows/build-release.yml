@@ -181,11 +181,18 @@ jobs:
           import subprocess
           from pathlib import Path
           sdk = Path(os.environ['ANDROID_HOME'])
-          modern = sdk / 'cmdline-tools/latest/bin/android'
+          # Hosted runners may keep their CLI under a versioned directory, not latest or PATH.
+          candidates = [sdk / 'cmdline-tools/latest/bin', *sorted((sdk / 'cmdline-tools').glob('*/bin'), reverse=True)]
+          tools = next((folder for folder in candidates if (folder / 'android').is_file() or (folder / 'sdkmanager').is_file()), None)
+          if tools is None:
+              raise SystemExit(f'Android command-line tools were not found under {sdk}.')
+          modern = tools / 'android'
           if modern.is_file():
               subprocess.run([str(modern), '--no-metrics', '--sdk=' + str(sdk), 'sdk', 'install', 'platforms/android-36', 'build-tools/35.0.0', 'platform-tools'], check=True)
           else:
-              subprocess.run(['sdkmanager', 'platforms;android-36', 'build-tools;35.0.0', 'platform-tools'], check=True)
+              subprocess.run([str(tools / 'sdkmanager'), '--sdk_root=' + str(sdk), 'platforms;android-36', 'build-tools;35.0.0', 'platform-tools'], check=True)
+          with open(os.environ['GITHUB_PATH'], 'a', encoding='utf-8') as environment_path:
+              environment_path.write(str(tools) + '\n')
           if not (sdk / 'platforms/android-36/android.jar').is_file() or not (sdk / 'build-tools/35.0.0/apksigner').is_file():
               raise SystemExit('Required Android SDK components were not installed.')
           Path('android/gradlew').chmod(0o755)
